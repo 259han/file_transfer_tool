@@ -1,0 +1,50 @@
+# 编译产物
+build/
+bin/
+lib/
+*.o
+*.obj
+*.so
+*.dylib
+*.dll
+*.exe
+*.out
+*.app
+
+# CMake 生成的文件
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+*.cmake
+!CMakeLists.txt
+
+# IDE相关
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# 日志和临时文件
+*.log
+log/
+logs/
+server_log.txt
+tmp/
+temp/
+
+# 测试文件
+tests/tmp/
+test_file.dat
+
+# 存储目录
+storage/*
+!storage/.gitkeep
+
+# 操作系统相关
+.DS_Store
+Thumbs.db 
+
+# 开发指南
+development_guide.md
