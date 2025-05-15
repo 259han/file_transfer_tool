@@ -2,6 +2,7 @@
 
 #include "../protocol.h"
 #include <string>
+#include <vector>
 
 namespace ft {
 namespace protocol {
@@ -16,10 +17,12 @@ public:
      * @param filename 文件名
      * @param offset 文件偏移量
      * @param length 请求的长度
+     * @param is_request 是否为请求消息
      */
     DownloadMessage(const std::string& filename = "", 
                    uint64_t offset = 0, 
-                   uint64_t length = 0);
+                   uint64_t length = 0,
+                   bool is_request = true);
     
     /**
      * @brief 从消息对象解析下载消息
@@ -78,6 +81,36 @@ public:
      */
     bool is_request() const;
     
+    /**
+     * @brief 设置文件数据
+     * @param data 文件数据
+     */
+    void set_file_data(const std::vector<uint8_t>& data);
+    
+    /**
+     * @brief 获取文件数据
+     * @return 文件数据
+     */
+    std::vector<uint8_t> get_file_data() const;
+    
+    /**
+     * @brief 设置文件总大小
+     * @param size 文件总大小
+     */
+    void set_total_size(uint64_t size);
+    
+    /**
+     * @brief 是否加密
+     * @return 是否加密
+     */
+    bool is_encrypted() const;
+    
+    /**
+     * @brief 设置加密标志
+     * @param encrypted 是否加密
+     */
+    void set_encrypted(bool encrypted);
+
 private:
     /**
      * @brief 序列化请求
@@ -94,6 +127,16 @@ private:
      */
     void deserialize();
     
+    /**
+     * @brief 从负载数据中解析元数据
+     */
+    void parse_metadata();
+    
+    /**
+     * @brief 更新负载数据中的元数据
+     */
+    void update_metadata();
+    
 private:
     std::string filename_;
     uint64_t offset_;
@@ -101,6 +144,7 @@ private:
     uint64_t total_size_;
     std::vector<uint8_t> response_data_;
     bool is_request_;
+    bool encrypted_;
 };
 
 } // namespace protocol

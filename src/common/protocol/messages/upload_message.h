@@ -2,6 +2,7 @@
 
 #include "../protocol.h"
 #include <string>
+#include <vector>
 
 namespace ft {
 namespace protocol {
@@ -66,6 +67,18 @@ public:
      */
     const std::vector<uint8_t>& get_file_data() const;
     
+    /**
+     * @brief 设置是否加密标志
+     * @param encrypted 是否加密
+     */
+    void set_encrypted(bool encrypted);
+    
+    /**
+     * @brief 是否加密
+     * @return 是否加密
+     */
+    bool is_encrypted() const;
+    
 private:
     /**
      * @brief 序列化元数据
@@ -77,11 +90,23 @@ private:
      */
     void deserialize_metadata();
     
+    /**
+     * @brief 从负载数据中解析元数据
+     */
+    void parse_metadata();
+    
+    /**
+     * @brief 更新负载数据中的元数据
+     */
+    void update_metadata();
+    
 private:
     std::string filename_;
     uint64_t offset_;
     uint64_t total_size_;
+    bool is_last_chunk_;
     std::vector<uint8_t> file_data_;
+    bool encrypted_;
 };
 
 } // namespace protocol

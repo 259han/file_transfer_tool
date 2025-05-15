@@ -8,17 +8,20 @@
 namespace ft {
 namespace protocol {
 
-DownloadMessage::DownloadMessage(const std::string& filename, uint64_t offset, uint64_t length)
+DownloadMessage::DownloadMessage(const std::string& filename, uint64_t offset, uint64_t length, bool is_request)
     : Message(OperationType::DOWNLOAD), 
       filename_(filename),
       offset_(offset),
       length_(length),
       total_size_(0),
       response_data_(),
-      is_request_(true) {
+      is_request_(is_request),
+      encrypted_(false) {
     
     // 序列化请求
-    serialize_request();
+    if (is_request_) {
+        serialize_request();
+    }
 }
 
 DownloadMessage::DownloadMessage(const Message& msg)
@@ -28,7 +31,8 @@ DownloadMessage::DownloadMessage(const Message& msg)
       length_(0),
       total_size_(0),
       response_data_(),
-      is_request_(false) {
+      is_request_(false),
+      encrypted_(false) {
     
     // 检查操作类型
     if (get_operation_type() != OperationType::DOWNLOAD) {
@@ -214,6 +218,54 @@ void DownloadMessage::deserialize() {
     }
     
     LOG_WARNING("Failed to deserialize download message: unrecognized format, payload size=%zu", payload.size());
+}
+
+void DownloadMessage::set_encrypted(bool encrypted) {
+    encrypted_ = encrypted;
+    
+    // 如果启用加密，设置加密标志
+    if (encrypted) {
+        set_flags(get_flags() | static_cast<uint8_t>(ProtocolFlags::ENCRYPTED));
+    } else {
+        set_flags(get_flags() & ~static_cast<uint8_t>(ProtocolFlags::ENCRYPTED));
+    }
+    
+    // 更新元数据
+    if (is_request_) {
+        serialize_request();
+    } else {
+        serialize_response();
+    }
+}
+
+bool DownloadMessage::is_encrypted() const {
+    return (get_flags() & static_cast<uint8_t>(ProtocolFlags::ENCRYPTED)) != 0;
+}
+
+void DownloadMessage::set_file_data(const std::vector<uint8_t>& data) {
+    response_data_ = data;
+    serialize_response();
+}
+
+std::vector<uint8_t> DownloadMessage::get_file_data() const {
+    return response_data_;
+}
+
+void DownloadMessage::set_total_size(uint64_t size) {
+    total_size_ = size;
+    if (!is_request_) {
+        serialize_response();
+    }
+}
+
+void DownloadMessage::parse_metadata() {
+    // 从负载中提取元数据
+    // 这是一个示例实现，需要根据实际协议格式调整
+}
+
+void DownloadMessage::update_metadata() {
+    // 更新负载中的元数据
+    // 这是一个示例实现，需要根据实际协议格式调整
 }
 
 } // namespace protocol

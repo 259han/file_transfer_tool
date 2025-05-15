@@ -1,6 +1,7 @@
 #include "client_core.h"
 #include "../../common/protocol/messages/upload_message.h"
 #include "../../common/protocol/messages/download_message.h"
+#include "../../common/utils/crypto/encryption.h"
 #include <chrono>
 #include <fstream>
 #include <filesystem>
@@ -19,7 +20,10 @@ ClientCore::ClientCore()
       progress_callback_(nullptr),
       is_connected_(false),
       heartbeat_thread_(),
-      stop_heartbeat_(false) {
+      stop_heartbeat_(false),
+      encryption_enabled_(false),
+      encryption_key_(),
+      encryption_iv_() {
 }
 
 ClientCore::~ClientCore() {
@@ -32,6 +36,30 @@ bool ClientCore::initialize(utils::LogLevel log_level) {
     
     LOG_INFO("Client initialized with log level: %d", static_cast<int>(log_level));
     return true;
+}
+
+bool ClientCore::enable_encryption() {
+    encryption_enabled_ = true;
+    
+    // 生成随机密钥和IV
+    encryption_key_ = utils::Encryption::random_bytes(32); // AES-256使用32字节密钥
+    encryption_iv_ = utils::Encryption::random_bytes(16);  // AES-CBC使用16字节IV
+    
+    LOG_INFO("Encryption enabled with AES-256-CBC");
+    return true;
+}
+
+bool ClientCore::disable_encryption() {
+    encryption_enabled_ = false;
+    encryption_key_.clear();
+    encryption_iv_.clear();
+    
+    LOG_INFO("Encryption disabled");
+    return true;
+}
+
+bool ClientCore::is_encryption_enabled() const {
+    return encryption_enabled_;
 }
 
 bool ClientCore::connect(const ServerInfo& server) {
@@ -1034,9 +1062,10 @@ std::future<TransferResult> ClientCore::download_async(const TransferRequest& re
     return std::async(std::launch::async, &ClientCore::download, this, request);
 }
 
-void ClientCore::set_progress_callback(std::function<void(size_t, size_t)> callback) {
-    progress_callback_ = callback;
-}
+// 函数已在头文件中内联定义
+// void ClientCore::set_progress_callback(ProgressCallback callback) {
+//     progress_callback_ = std::move(callback);
+// }
 
 bool ClientCore::is_connected() const {
     return is_connected_ && socket_ && socket_->is_connected();

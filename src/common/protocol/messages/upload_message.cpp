@@ -1,6 +1,7 @@
 #include "upload_message.h"
 #include <cstring>
 #include <stdexcept>
+#include <string>
 
 namespace ft {
 namespace protocol {
@@ -122,6 +123,34 @@ void UploadMessage::deserialize_metadata() {
         file_data_.resize(file_data_size);
         std::memcpy(file_data_.data(), payload.data() + metadata_size, file_data_size);
     }
+}
+
+void UploadMessage::set_encrypted(bool encrypted) {
+    encrypted_ = encrypted;
+    
+    // 如果启用加密，设置加密标志
+    if (encrypted) {
+        set_flags(get_flags() | static_cast<uint8_t>(ProtocolFlags::ENCRYPTED));
+    } else {
+        set_flags(get_flags() & ~static_cast<uint8_t>(ProtocolFlags::ENCRYPTED));
+    }
+    
+    // 更新元数据
+    serialize_metadata();
+}
+
+bool UploadMessage::is_encrypted() const {
+    return (get_flags() & static_cast<uint8_t>(ProtocolFlags::ENCRYPTED)) != 0;
+}
+
+void UploadMessage::parse_metadata() {
+    // 从负载中提取元数据
+    // 这是一个示例实现，需要根据实际协议格式调整
+}
+
+void UploadMessage::update_metadata() {
+    // 更新负载中的元数据
+    // 这是一个示例实现，需要根据实际协议格式调整
 }
 
 } // namespace protocol

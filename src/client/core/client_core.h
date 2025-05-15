@@ -5,6 +5,7 @@
 #include <future>
 #include <thread>
 #include <atomic>
+#include <functional>
 #include "../../common/network/socket/tcp_socket.h"
 #include "../../common/utils/logging/logger.h"
 
@@ -69,6 +70,8 @@ struct ServerInfo {
  */
 class ClientCore {
 public:
+    using ProgressCallback = std::function<void(size_t, size_t)>;
+    
     /**
      * @brief 构造函数
      */
@@ -87,6 +90,24 @@ public:
     bool initialize(utils::LogLevel log_level = utils::LogLevel::INFO);
     
     /**
+     * @brief 加密控制
+     * @return 是否启用加密
+     */
+    bool enable_encryption();
+    
+    /**
+     * @brief 加密控制
+     * @return 是否禁用加密
+     */
+    bool disable_encryption();
+    
+    /**
+     * @brief 是否已启用加密
+     * @return 是否已启用加密
+     */
+    bool is_encryption_enabled() const;
+    
+    /**
      * @brief 连接到服务器
      * @param server 服务器信息
      * @return 是否连接成功
@@ -94,20 +115,15 @@ public:
     bool connect(const ServerInfo& server);
     
     /**
-     * @brief 启动心跳线程
-     */
-    void start_heartbeat_thread();
-    
-    /**
-     * @brief 发送心跳包检测连接状态
-     * @return 心跳是否成功
-     */  
-    bool send_heartbeat();
-    
-    /**
      * @brief 断开与服务器的连接
      */
     void disconnect();
+    
+    /**
+     * @brief 是否已连接
+     * @return 是否已连接
+     */
+    bool is_connected() const;
     
     /**
      * @brief 上传文件
@@ -141,13 +157,9 @@ public:
      * @brief 设置进度回调函数
      * @param callback 回调函数
      */
-    void set_progress_callback(std::function<void(size_t, size_t)> callback);
-    
-    /**
-     * @brief 是否已连接
-     * @return 是否已连接
-     */
-    bool is_connected() const;
+    void set_progress_callback(ProgressCallback callback) {
+        progress_callback_ = std::move(callback);
+    }
     
     /**
      * @brief 获取底层套接字
@@ -157,13 +169,39 @@ public:
         return socket_.get();
     }
     
+    /**
+     * @brief 发送心跳包
+     * @return 是否成功
+     */
+    bool send_heartbeat();
+    
 private:
+    /**
+     * @brief 启动心跳线程
+     */
+    void start_heartbeat_thread();
+    
+    /**
+     * @brief 停止心跳线程
+     */
+    void stop_heartbeat_thread();
+    
+    /**
+     * @brief 心跳检测循环
+     */
+    void heartbeat_loop();
+    
     ServerInfo server_info_;
     std::unique_ptr<network::TcpSocket> socket_;
-    std::function<void(size_t, size_t)> progress_callback_;
+    ProgressCallback progress_callback_;
     bool is_connected_;
     std::thread heartbeat_thread_;      // 心跳线程
     std::atomic<bool> stop_heartbeat_;  // 停止心跳线程标志
+    
+    // 加密相关
+    bool encryption_enabled_;
+    std::vector<uint8_t> encryption_key_;
+    std::vector<uint8_t> encryption_iv_;
 };
 
 } // namespace client
