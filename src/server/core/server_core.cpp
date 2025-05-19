@@ -3,6 +3,7 @@
 #include "../../common/protocol/messages/download_message.h"
 #include "../../common/protocol/messages/key_exchange_message.h"
 #include "../../common/utils/crypto/encryption.h"
+#include "../session/session_manager.h"
 #include <filesystem>
 #include <fstream>
 #include <chrono>
@@ -62,15 +63,30 @@ void ClientSession::start() {
 }
 
 void ClientSession::stop() {
-    running_ = false;
-    
-    if (socket_) {
-        socket_->close();
+    if (!running_) {
+        return;  // 避免重复停止
     }
     
+    // 首先设置运行标志，避免重入问题
+    running_ = false;
+    
+    // 关闭套接字，这会导致阻塞在recv/send的线程返回错误
+    if (socket_) {
+        socket_->close();
+        socket_.reset();  // 释放套接字资源
+    }
+    
+    // 等待工作线程结束 - 使用直接join，避免复杂的线程管理
     if (thread_.joinable()) {
         thread_.join();
     }
+    
+    // 清理加密相关资源
+    encryption_key_.clear();
+    encryption_iv_.clear();
+    dh_private_key_.clear();
+    
+    LOG_INFO("Session %zu: Stopped", session_id_);
 }
 
 std::string ClientSession::get_client_address() const {
@@ -90,395 +106,258 @@ bool ClientSession::is_connected() const {
 }
 
 void ClientSession::process() {
-    try {
-        // 连接握手
-        LOG_INFO("Session %zu: Started for client %s", session_id_, get_client_address().c_str());
-        
-        // 首先检查客户端是否还连接，添加更详细的日志
-        if (!socket_) {
-            LOG_WARNING("Session %zu: Socket is null during initialization", session_id_);
+    // 连接握手
+    LOG_INFO("Session %zu: Started for client %s", session_id_, get_client_address().c_str());
+    
+    // 首先检查客户端是否还连接
+    if (!socket_) {
+        LOG_WARNING("Session %zu: Socket is null during initialization", session_id_);
+        return;
+    }
+    
+    if (!socket_->is_connected()) {
+        LOG_WARNING("Session %zu: Client disconnected during initialization, fd=%d", 
+                  session_id_, socket_->get_fd());
+        return;
+    }
+    
+    int socket_fd = socket_->get_fd();
+    LOG_DEBUG("Session %zu: Socket fd=%d is valid and connected", 
+             session_id_, socket_fd);
+    
+    LOG_INFO("Session %zu: Client socket connected, waiting for heartbeat", session_id_);
+    
+    // 连接建立后延迟一点时间，让客户端先准备好
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    
+    // 为了增加健壮性，在session开始时直接设置socket超时较短
+    socket_->set_recv_timeout(std::chrono::milliseconds(3000));
+    
+    // 连接建立后等待更长时间，让客户端准备好发送心跳
+    // 但每200ms检查一次连接状态，避免等待断开的连接
+    int wait_intervals = 6; // 6次，每次200ms，总共1200ms
+    for (int i = 0; i < wait_intervals; i++) {
+        if (!socket_ || !socket_->is_connected()) {
+            LOG_WARNING("Session %zu: Client disconnected during wait period (%d/6)", 
+                       session_id_, i+1);
             return;
         }
         
-        if (!socket_->is_connected()) {
-            LOG_WARNING("Session %zu: Client disconnected during initialization, fd=%d", 
-                      session_id_, socket_->get_fd());
-            return;
-        }
+        // 每隔200ms检查一次socket状态
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
         
-        int socket_fd = socket_->get_fd();
-        LOG_DEBUG("Session %zu: Socket fd=%d is valid and connected", 
-                 session_id_, socket_fd);
-        
-        LOG_INFO("Session %zu: Client socket connected, waiting for heartbeat", session_id_);
-        
-        // 连接建立后延迟一点时间，让客户端先准备好
-        std::this_thread::sleep_for(std::chrono::milliseconds(50));
-        
-        // 为了增加健壮性，在session开始时直接设置socket超时较短
-        socket_->set_recv_timeout(std::chrono::milliseconds(3000));
-        
-        // 连接建立后等待更长时间，让客户端准备好发送心跳
-        // 但每200ms检查一次连接状态，避免等待断开的连接
-        int wait_intervals = 6; // 6次，每次200ms，总共1200ms
-        for (int i = 0; i < wait_intervals; i++) {
-            if (!socket_ || !socket_->is_connected()) {
-                LOG_WARNING("Session %zu: Client disconnected during wait period (%d/6)", 
-                           session_id_, i+1);
-                return;
-            }
-            
-            // 每隔200ms检查一次socket状态
-            std::this_thread::sleep_for(std::chrono::milliseconds(200));
-            
-            // 额外检查socket状态，更主动地发现问题
-            if (socket_) {
-                // 主动检测TCP连接状态
-                int error = 0;
-                socklen_t len = sizeof(error);
-                if (getsockopt(socket_->get_fd(), SOL_SOCKET, SO_ERROR, &error, &len) == 0) {
-                    if (error != 0) {
-                        LOG_WARNING("Session %zu: Socket error detected during wait: %s (errno=%d)", 
-                                   session_id_, strerror(error), error);
-                        return;
-                    }
-                }
-                
-                // 验证socket是否连接
-                if (!socket_->is_connected()) {
-                    LOG_WARNING("Session %zu: Connection lost during wait interval %d/6", 
-                               session_id_, i+1);
+        // 额外检查socket状态，更主动地发现问题
+        if (socket_) {
+            // 主动检测TCP连接状态
+            int error = 0;
+            socklen_t len = sizeof(error);
+            if (getsockopt(socket_->get_fd(), SOL_SOCKET, SO_ERROR, &error, &len) == 0) {
+                if (error != 0) {
+                    LOG_WARNING("Session %zu: Socket error detected during wait: %s (errno=%d)", 
+                               session_id_, strerror(error), error);
                     return;
                 }
             }
-        }
-        LOG_INFO("Session %zu: Waited 1200ms after session start to ensure client readiness", 
-                session_id_);
-        
-        int consecutive_errors = 0;
-        const int max_consecutive_errors = 5;  // 允许的最大连续错误数
-        
-        while (running_) {
-            // 检查套接字状态
-            if (!socket_ || !socket_->is_connected()) {
-                LOG_WARNING("Session %zu: Socket disconnected, exiting session", session_id_);
-                break;
+            
+            // 验证socket是否连接
+            if (!socket_->is_connected()) {
+                LOG_WARNING("Session %zu: Connection lost during wait interval %d/6", 
+                           session_id_, i+1);
+                return;
             }
-            
-            // 设置单次接收超时，防止永久阻塞
-            socket_->set_recv_timeout(std::chrono::milliseconds(5000));
-            
-            // 接收协议头
-            std::vector<uint8_t> header_buffer(sizeof(protocol::ProtocolHeader));
-            LOG_DEBUG("Session %zu: Waiting to receive protocol header (%zu bytes)...", 
-                     session_id_, sizeof(protocol::ProtocolHeader));
-            
-            // 添加协议头大小的详细信息
-            LOG_DEBUG("Session %zu: Protocol header size details - "
-                     "magic(4) + type(1) + flags(1) + length(4) + checksum(4) + reserved(2) = %zu bytes", 
-                     session_id_, sizeof(protocol::ProtocolHeader));
-                     
-            // 确保结构体大小正确
-            LOG_DEBUG("Session %zu: Actual protocol header size: %zu bytes", 
-                     session_id_, sizeof(protocol::ProtocolHeader));
+        }
+    }
+    LOG_INFO("Session %zu: Waited 1200ms after session start to ensure client readiness", 
+            session_id_);
+    
+    int consecutive_errors = 0;
+    const int max_consecutive_errors = 5;  // 允许的最大连续错误数
+    
+    while (running_) {
+        // 检查套接字状态
+        if (!socket_ || !socket_->is_connected()) {
+            LOG_WARNING("Session %zu: Socket disconnected, exiting session", session_id_);
+            break;
+        }
+        
+        // 设置单次接收超时，防止永久阻塞
+        socket_->set_recv_timeout(std::chrono::milliseconds(5000));
+        
+        // 接收协议头
+        std::vector<uint8_t> header_buffer(sizeof(protocol::ProtocolHeader));
+        LOG_DEBUG("Session %zu: Waiting to receive protocol header (%zu bytes)...", 
+                 session_id_, sizeof(protocol::ProtocolHeader));
+        
+        // 添加协议头大小的详细信息
+        LOG_DEBUG("Session %zu: Protocol header size details - "
+                 "magic(4) + type(1) + flags(1) + length(4) + checksum(4) + reserved(2) = %zu bytes", 
+                 session_id_, sizeof(protocol::ProtocolHeader));
+                 
+        // 确保结构体大小正确
+        LOG_DEBUG("Session %zu: Actual protocol header size: %zu bytes", 
+                 session_id_, sizeof(protocol::ProtocolHeader));
 
-            // 增加错误处理
-            network::SocketError err = network::SocketError::SUCCESS;
-            
-            try {
-                err = socket_->recv_all(header_buffer.data(), header_buffer.size());
-            } catch (const std::exception& e) {
-                LOG_ERROR("Session %zu: Exception during header receive: %s", session_id_, e.what());
+        // 接收头部数据
+        network::SocketError err = network::SocketError::SUCCESS;
+        
+        // 使用直接错误处理而不是异常捕获
+        err = socket_->recv_all(header_buffer.data(), header_buffer.size());
+        
+        if (err != network::SocketError::SUCCESS) {
+            if (err == network::SocketError::CLOSED) {
+                LOG_INFO("Session %zu: Connection closed by client", session_id_);
+                break;  // 连接关闭，立即退出循环
+            } else {
+                // 添加更详细的错误信息
+                char err_buf[128] = {0};
+                char* err_result = strerror_r(errno, err_buf, sizeof(err_buf));
+                LOG_ERROR("Session %zu: Failed to receive header: %d, socket connected: %d, errno: %d (%s)", 
+                         session_id_, static_cast<int>(err), socket_->is_connected(), 
+                         errno, err_result);
+                         
+                LOG_DEBUG("Session %zu: Socket details - local: %s:%d, remote: %s:%d", 
+                         session_id_, 
+                         socket_->get_local_address().c_str(), 
+                         socket_->get_local_port(),
+                         socket_->get_remote_address().c_str(),
+                         socket_->get_remote_port());
+                
                 // 增加连续错误计数
                 consecutive_errors++;
                 if (consecutive_errors >= max_consecutive_errors) {
                     LOG_ERROR("Session %zu: Too many consecutive errors, exiting session", session_id_);
                     break;
                 }
-                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            }
+            
+            // 给套接字一些时间恢复
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+            
+            // 如果是一些可恢复的错误，可以继续尝试
+            if (err == network::SocketError::TIMEOUT) {
+                LOG_WARNING("Session %zu: Receive timeout, retrying...", session_id_);
                 continue;
             }
             
-            if (err != network::SocketError::SUCCESS) {
-                if (err == network::SocketError::CLOSED) {
-                    LOG_INFO("Session %zu: Connection closed by client", session_id_);
-                    break;  // 连接关闭，立即退出循环
-                } else {
-                    // 添加更详细的错误信息
-                    char err_buf[128] = {0};
-                    strerror_r(errno, err_buf, sizeof(err_buf));
-                    LOG_ERROR("Session %zu: Failed to receive header: %d, socket connected: %d, errno: %d (%s)", 
-                             session_id_, static_cast<int>(err), socket_->is_connected(), 
-                             errno, err_buf);
-                             
-                    LOG_DEBUG("Session %zu: Socket details - local: %s:%d, remote: %s:%d", 
-                             session_id_, 
-                             socket_->get_local_address().c_str(), 
-                             socket_->get_local_port(),
-                             socket_->get_remote_address().c_str(),
-                             socket_->get_remote_port());
-                    
-                    // 增加连续错误计数
-                    consecutive_errors++;
-                    if (consecutive_errors >= max_consecutive_errors) {
-                        LOG_ERROR("Session %zu: Too many consecutive errors, exiting session", session_id_);
-                        break;
-                    }
-                }
-                
-                // 给套接字一些时间恢复
-                std::this_thread::sleep_for(std::chrono::milliseconds(200));
-                
-                // 如果是一些可恢复的错误，可以继续尝试
-                if (err == network::SocketError::TIMEOUT) {
-                    LOG_WARNING("Session %zu: Receive timeout, retrying...", session_id_);
-                    continue;
-                }
-                
-                // 其他不可恢复的错误
-                LOG_ERROR("Session %zu: Unrecoverable socket error, exiting session", session_id_);
+            // 其他不可恢复的错误
+            LOG_ERROR("Session %zu: Unrecoverable socket error, exiting session", session_id_);
+            break;
+        }
+        
+        // 重置连续错误计数
+        consecutive_errors = 0;
+        
+        // 添加调试信息 - 打印接收到的原始字节
+        LOG_DEBUG("Session %zu: Received header bytes (hex): ", session_id_);
+        for (size_t i = 0; i < header_buffer.size(); i += 4) {
+            char debug_buf[128];
+            snprintf(debug_buf, sizeof(debug_buf), "  %02x %02x %02x %02x", 
+                    i < header_buffer.size() ? header_buffer[i] : 0,
+                    i+1 < header_buffer.size() ? header_buffer[i+1] : 0,
+                    i+2 < header_buffer.size() ? header_buffer[i+2] : 0,
+                    i+3 < header_buffer.size() ? header_buffer[i+3] : 0);
+            LOG_DEBUG("Session %zu: %s", session_id_, debug_buf);
+        }
+        
+        // 解析协议头
+        protocol::ProtocolHeader header;
+        std::memcpy(&header, header_buffer.data(), sizeof(header));
+        
+        // 复制header字段到局部变量，避免结构体对齐问题
+        uint32_t magic_value = header.magic;
+        uint8_t type_value = header.type;
+        uint8_t flags_value = header.flags;
+        uint32_t length_value = header.length;
+        uint32_t checksum_value = header.checksum;
+        
+        // 检查魔数
+        if (magic_value != protocol::PROTOCOL_MAGIC) {
+            LOG_ERROR("Session %zu: Invalid protocol magic: 0x%08x, expected: 0x%08x", 
+                      session_id_, magic_value, protocol::PROTOCOL_MAGIC);
+            consecutive_errors++;
+            if (consecutive_errors >= max_consecutive_errors) {
+                LOG_ERROR("Session %zu: Too many consecutive errors, exiting session", session_id_);
                 break;
             }
-            
-            // 重置连续错误计数
-            consecutive_errors = 0;
-            
-            // 添加调试信息 - 打印接收到的原始字节
-            LOG_DEBUG("Session %zu: Received header bytes (hex): ", session_id_);
-            for (size_t i = 0; i < header_buffer.size(); i += 4) {
-                char debug_buf[128];
-                snprintf(debug_buf, sizeof(debug_buf), "  %02x %02x %02x %02x", 
-                        i < header_buffer.size() ? header_buffer[i] : 0,
-                        i+1 < header_buffer.size() ? header_buffer[i+1] : 0,
-                        i+2 < header_buffer.size() ? header_buffer[i+2] : 0,
-                        i+3 < header_buffer.size() ? header_buffer[i+3] : 0);
-                LOG_DEBUG("Session %zu: %s", session_id_, debug_buf);
-            }
-            
-            // 解析协议头
-            protocol::ProtocolHeader header;
-            std::memcpy(&header, header_buffer.data(), sizeof(header));
-            
-            // 复制header字段到局部变量，避免结构体对齐问题
-            uint32_t magic_value = header.magic;
-            uint8_t type_value = header.type;
-            uint8_t flags_value = header.flags;
-            uint32_t length_value = header.length;
-            uint32_t checksum_value = header.checksum;
-            
-            // 检查魔数
-            if (magic_value != protocol::PROTOCOL_MAGIC) {
-                LOG_ERROR("Session %zu: Invalid protocol magic: 0x%08x, expected: 0x%08x", 
-                          session_id_, magic_value, protocol::PROTOCOL_MAGIC);
-                consecutive_errors++;
-                if (consecutive_errors >= max_consecutive_errors) {
-                    LOG_ERROR("Session %zu: Too many consecutive errors, exiting session", session_id_);
-                    break;
-                }
-                continue;
-            }
-            
-            LOG_DEBUG("Session %zu: Received valid header - magic: 0x%08x, type: %d, flags: %d, length: %u, checksum: 0x%08x", 
-                     session_id_, magic_value, type_value, flags_value, length_value, checksum_value);
-            
-            // 检查长度是否合理，防止恶意/损坏的包
-            if (length_value > 100 * 1024 * 1024) {  // 限制100MB
-                LOG_ERROR("Session %zu: Message length too large: %u bytes", session_id_, length_value);
-                consecutive_errors++;
-                if (consecutive_errors >= max_consecutive_errors) {
-                    LOG_ERROR("Session %zu: Too many consecutive errors, exiting session", session_id_);
-                    break;
-                }
-                continue;
-            }
-            
-            // 接收消息体
-            std::vector<uint8_t> message_buffer(sizeof(protocol::ProtocolHeader) + length_value);
-            std::memcpy(message_buffer.data(), header_buffer.data(), sizeof(protocol::ProtocolHeader));
-            
-            if (length_value > 0) {
-                LOG_DEBUG("Session %zu: Receiving message body of length %u", session_id_, length_value);
-                err = socket_->recv_all(message_buffer.data() + sizeof(protocol::ProtocolHeader), length_value);
-                if (err != network::SocketError::SUCCESS) {
-                    LOG_ERROR("Session %zu: Failed to receive message body: %d", session_id_, static_cast<int>(err));
-                    consecutive_errors++;
-                    if (consecutive_errors >= max_consecutive_errors) {
-                        LOG_ERROR("Session %zu: Too many consecutive errors, exiting session", session_id_);
-                        break;
-                    }
-                    continue;
-                }
-                LOG_DEBUG("Session %zu: Message body received successfully", session_id_);
-            }
-            
-            // 根据操作类型处理消息
-            protocol::OperationType op_type = static_cast<protocol::OperationType>(type_value);
-            LOG_INFO("Session %zu: Processing message of type: %d", session_id_, static_cast<int>(op_type));
-            
-            bool message_handled = false;
-            try {
-                switch (op_type) {
-                    case protocol::OperationType::UPLOAD:
-                        message_handled = handle_upload(message_buffer);
-                        break;
-                    
-                    case protocol::OperationType::DOWNLOAD:
-                        message_handled = handle_download(message_buffer);
-                        break;
-                    
-                    case protocol::OperationType::KEY_EXCHANGE:
-                        message_handled = handle_key_exchange(message_buffer);
-                        break;
-                    
-                    case protocol::OperationType::HEARTBEAT:
-                        // 发送心跳响应
-                        LOG_DEBUG("Session %zu: Received heartbeat, preparing response", session_id_);
-                        try {
-                            // 创建新的心跳响应消息而不是直接回传接收到的消息
-                            protocol::Message response(protocol::OperationType::HEARTBEAT);
-                            std::vector<uint8_t> response_buffer;
-                            if (!response.encode(response_buffer)) {
-                                LOG_ERROR("Session %zu: Failed to encode heartbeat response", session_id_);
-                                message_handled = false;
-                                break;
-                            }
-                            
-                            // 添加详细调试信息
-                            LOG_DEBUG("Session %zu: Heartbeat response encoded, size: %zu bytes", 
-                                     session_id_, response_buffer.size());
-                            
-                            // 记录发送的心跳响应头部
-                            if (response_buffer.size() >= sizeof(protocol::ProtocolHeader)) {
-                                protocol::ProtocolHeader* sent_header = 
-                                    reinterpret_cast<protocol::ProtocolHeader*>(response_buffer.data());
-                                
-                                // 由于ProtocolHeader是packed结构体，需要复制成员变量而不是直接引用
-                                uint32_t sent_magic = sent_header->magic;
-                                uint8_t sent_type = sent_header->type;
-                                uint32_t sent_length = sent_header->length;
-                                
-                                // 确保magic和type值正确 - 双重检查，确保字段被正确初始化
-                                if (sent_magic != protocol::PROTOCOL_MAGIC) {
-                                    LOG_ERROR("Session %zu: Invalid magic in heartbeat response: 0x%08x, correcting", 
-                                             session_id_, sent_magic);
-                                    sent_header->magic = protocol::PROTOCOL_MAGIC;
-                                    sent_magic = protocol::PROTOCOL_MAGIC;
-                                }
-                                
-                                if (sent_type != static_cast<uint8_t>(protocol::OperationType::HEARTBEAT)) {
-                                    LOG_ERROR("Session %zu: Invalid type in heartbeat response: %d, correcting", 
-                                             session_id_, sent_type);
-                                    sent_header->type = static_cast<uint8_t>(protocol::OperationType::HEARTBEAT);
-                                    sent_type = static_cast<uint8_t>(protocol::OperationType::HEARTBEAT);
-                                }
-                                
-                                LOG_DEBUG("Session %zu: Heartbeat response header validated - "
-                                         "magic: 0x%08x, type: %d, length: %u", 
-                                         session_id_, sent_magic, sent_type, sent_length);
-                            } else {
-                                LOG_ERROR("Session %zu: Response buffer too small: %zu bytes", 
-                                          session_id_, response_buffer.size());
-                                message_handled = false;
-                                break;
-                            }
-                            
-                            // 检查socket状态
-                            if (!socket_ || !socket_->is_connected()) {
-                                LOG_ERROR("Session %zu: Socket not connected for heartbeat response", session_id_);
-                                message_handled = false;
-                                break;
-                            }
-                            
-                            // 确保没有错误发生前先设置为已处理 - 即使心跳响应发送失败，也视为处理过消息
-                            // 这样服务器不会因为心跳响应问题而立即断开连接
-                            message_handled = true;
-                            
-                            // 设置发送超时，防止永久阻塞
-                            socket_->set_send_timeout(std::chrono::milliseconds(3000));
-                            
-                            // 增加短暂延迟, 确保客户端已准备好接收响应
-                            std::this_thread::sleep_for(std::chrono::milliseconds(50));
-                            
-                            // 尝试发送心跳响应，失败时记录警告但不中断会话
-                            int send_retry = 0;
-                            const int max_send_retries = 3;
-                            bool send_success = false;
-                            
-                            while (send_retry < max_send_retries && !send_success) {
-                                try {
-                                    // 每次发送前检查连接状态
-                                    if (!socket_ || !socket_->is_connected()) {
-                                        LOG_WARNING("Session %zu: Socket disconnected during heartbeat response retry", 
-                                                  session_id_);
-                                        break;
-                                    }
-                                    
-                                    network::SocketError send_err = socket_->send_all(response_buffer.data(), response_buffer.size());
-                                    if (send_err == network::SocketError::SUCCESS) {
-                                        send_success = true;
-                                        LOG_DEBUG("Session %zu: Heartbeat response sent successfully", session_id_);
-                                    } else {
-                                        send_retry++;
-                                        
-                                        if (send_retry < max_send_retries) {
-                                            LOG_WARNING("Session %zu: Failed to send heartbeat response: %d, retry %d/%d", 
-                                                       session_id_, static_cast<int>(send_err), send_retry, max_send_retries);
-                                            
-                                            // 添加短暂延迟后重试
-                                            std::this_thread::sleep_for(std::chrono::milliseconds(50));
-                                        } else {
-                                            LOG_WARNING("Session %zu: Failed to send heartbeat response after %d retries", 
-                                                      session_id_, max_send_retries);
-                                        }
-                                    }
-                                } catch (const std::exception& e) {
-                                    send_retry++;
-                                    
-                                    if (send_retry < max_send_retries) {
-                                        LOG_WARNING("Session %zu: Exception during heartbeat send: %s, retry %d/%d", 
-                                                  session_id_, e.what(), send_retry, max_send_retries);
-                                        
-                                        // 添加短暂延迟后重试
-                                        std::this_thread::sleep_for(std::chrono::milliseconds(50));
-                                    } else {
-                                        LOG_WARNING("Session %zu: Exception during heartbeat send after %d retries: %s", 
-                                                  session_id_, max_send_retries, e.what());
-                                    }
-                                }
-                            }
-                        } catch (const std::exception& e) {
-                            LOG_ERROR("Session %zu: Exception while preparing heartbeat response: %s", 
-                                     session_id_, e.what());
-                            message_handled = false;
-                        }
-                        break;
-                    
-                    default:
-                        LOG_WARNING("Session %zu: Unknown operation type: %d", session_id_, static_cast<int>(op_type));
-                        message_handled = false;
-                        break;
-                }
-            } catch (const std::exception& e) {
-                LOG_ERROR("Session %zu: Exception while processing message: %s", session_id_, e.what());
-                message_handled = false;
-            }
-            
-            if (!message_handled) {
-                consecutive_errors++;
-                if (consecutive_errors >= max_consecutive_errors) {
-                    LOG_ERROR("Session %zu: Too many consecutive errors, exiting session", session_id_);
-                    break;
-                }
-            } else {
-                // 成功处理消息后重置连续错误计数
-                consecutive_errors = 0;
-            }
-            
-            // 短暂延迟，给客户端一些处理时间
-            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            continue;
         }
-    } catch (const std::exception& e) {
-        LOG_ERROR("Session %zu: Exception: %s", session_id_, e.what());
+        
+        LOG_DEBUG("Session %zu: Received valid header - magic: 0x%08x, type: %d, flags: %d, length: %u, checksum: 0x%08x", 
+                 session_id_, magic_value, type_value, flags_value, length_value, checksum_value);
+        
+        // 检查长度是否合理，防止恶意/损坏的包
+        if (length_value > 100 * 1024 * 1024) {  // 限制100MB
+            LOG_ERROR("Session %zu: Message length too large: %u bytes", session_id_, length_value);
+            consecutive_errors++;
+            if (consecutive_errors >= max_consecutive_errors) {
+                LOG_ERROR("Session %zu: Too many consecutive errors, exiting session", session_id_);
+                break;
+            }
+            continue;
+        }
+        
+        // 接收消息体
+        std::vector<uint8_t> message_buffer(sizeof(protocol::ProtocolHeader) + length_value);
+        std::memcpy(message_buffer.data(), header_buffer.data(), sizeof(protocol::ProtocolHeader));
+        
+        if (length_value > 0) {
+            LOG_DEBUG("Session %zu: Receiving message body of length %u", session_id_, length_value);
+            err = socket_->recv_all(message_buffer.data() + sizeof(protocol::ProtocolHeader), length_value);
+            if (err != network::SocketError::SUCCESS) {
+                LOG_ERROR("Session %zu: Failed to receive message body: %d", session_id_, static_cast<int>(err));
+                consecutive_errors++;
+                if (consecutive_errors >= max_consecutive_errors) {
+                    LOG_ERROR("Session %zu: Too many consecutive errors, exiting session", session_id_);
+                    break;
+                }
+                continue;
+            }
+            LOG_DEBUG("Session %zu: Message body received successfully", session_id_);
+        }
+        
+        // 根据操作类型处理消息
+        protocol::OperationType op_type = static_cast<protocol::OperationType>(type_value);
+        LOG_INFO("Session %zu: Processing message of type: %d", session_id_, static_cast<int>(op_type));
+        
+        bool message_handled = false;
+        
+        // 使用一个函数调用而不是try-catch嵌套
+        switch (op_type) {
+            case protocol::OperationType::UPLOAD:
+                message_handled = handle_upload(message_buffer);
+                break;
+            
+            case protocol::OperationType::DOWNLOAD:
+                message_handled = handle_download(message_buffer);
+                break;
+            
+            case protocol::OperationType::KEY_EXCHANGE:
+                message_handled = handle_key_exchange(message_buffer);
+                break;
+            
+            case protocol::OperationType::HEARTBEAT:
+                message_handled = handle_heartbeat_response(message_buffer);
+                break;
+            
+            default:
+                LOG_WARNING("Session %zu: Unknown operation type: %d", session_id_, static_cast<int>(op_type));
+                message_handled = false;
+                break;
+        }
+        
+        if (!message_handled) {
+            consecutive_errors++;
+            if (consecutive_errors >= max_consecutive_errors) {
+                LOG_ERROR("Session %zu: Too many consecutive errors, exiting session", session_id_);
+                break;
+            }
+        } else {
+            // 成功处理消息后重置连续错误计数
+            consecutive_errors = 0;
+        }
+        
+        // 短暂延迟，给客户端一些处理时间
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
     
     LOG_INFO("Session %zu: Ended for client %s", session_id_, get_client_address().c_str());
@@ -1181,17 +1060,114 @@ std::vector<uint8_t> ClientSession::decrypt_data(const std::vector<uint8_t>& dat
     return utils::Encryption::aes_decrypt(data, encryption_key_, encryption_iv_);
 }
 
+// 新方法：处理心跳响应
+bool ClientSession::handle_heartbeat_response(const std::vector<uint8_t>& buffer) {
+    // 发送心跳响应
+    LOG_DEBUG("Session %zu: Received heartbeat, preparing response", session_id_);
+    
+    // 创建新的心跳响应消息
+    protocol::Message response(protocol::OperationType::HEARTBEAT);
+    std::vector<uint8_t> response_buffer;
+    if (!response.encode(response_buffer)) {
+        LOG_ERROR("Session %zu: Failed to encode heartbeat response", session_id_);
+        return false;
+    }
+    
+    // 添加详细调试信息
+    LOG_DEBUG("Session %zu: Heartbeat response encoded, size: %zu bytes", 
+             session_id_, response_buffer.size());
+    
+    // 检查和验证心跳响应头部
+    if (response_buffer.size() < sizeof(protocol::ProtocolHeader)) {
+        LOG_ERROR("Session %zu: Response buffer too small: %zu bytes", 
+                  session_id_, response_buffer.size());
+        return false;
+    }
+    
+    // 记录发送的心跳响应头部
+    protocol::ProtocolHeader* sent_header = 
+        reinterpret_cast<protocol::ProtocolHeader*>(response_buffer.data());
+    
+    // 由于ProtocolHeader是packed结构体，需要复制成员变量而不是直接引用
+    uint32_t sent_magic = sent_header->magic;
+    uint8_t sent_type = sent_header->type;
+    uint32_t sent_length = sent_header->length;
+    
+    // 确保magic和type值正确
+    if (sent_magic != protocol::PROTOCOL_MAGIC) {
+        LOG_ERROR("Session %zu: Invalid magic in heartbeat response: 0x%08x, correcting", 
+                 session_id_, sent_magic);
+        sent_header->magic = protocol::PROTOCOL_MAGIC;
+        sent_magic = protocol::PROTOCOL_MAGIC;
+    }
+    
+    if (sent_type != static_cast<uint8_t>(protocol::OperationType::HEARTBEAT)) {
+        LOG_ERROR("Session %zu: Invalid type in heartbeat response: %d, correcting", 
+                 session_id_, sent_type);
+        sent_header->type = static_cast<uint8_t>(protocol::OperationType::HEARTBEAT);
+        sent_type = static_cast<uint8_t>(protocol::OperationType::HEARTBEAT);
+    }
+    
+    LOG_DEBUG("Session %zu: Heartbeat response header validated - "
+             "magic: 0x%08x, type: %d, length: %u", 
+             session_id_, sent_magic, sent_type, sent_length);
+    
+    // 检查socket状态
+    if (!socket_ || !socket_->is_connected()) {
+        LOG_ERROR("Session %zu: Socket not connected for heartbeat response", session_id_);
+        return false;
+    }
+    
+    // 设置发送超时，防止永久阻塞
+    socket_->set_send_timeout(std::chrono::milliseconds(3000));
+    
+    // 增加短暂延迟, 确保客户端已准备好接收响应
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    
+    // 尝试发送心跳响应，失败时记录警告但不中断会话
+    int send_retry = 0;
+    const int max_send_retries = 3;
+    bool send_success = false;
+    
+    while (send_retry < max_send_retries && !send_success) {
+        // 每次发送前检查连接状态
+        if (!socket_ || !socket_->is_connected()) {
+            LOG_WARNING("Session %zu: Socket disconnected during heartbeat response retry", 
+                      session_id_);
+            break;
+        }
+        
+        network::SocketError send_err = socket_->send_all(response_buffer.data(), response_buffer.size());
+        if (send_err == network::SocketError::SUCCESS) {
+            send_success = true;
+            LOG_DEBUG("Session %zu: Heartbeat response sent successfully", session_id_);
+        } else {
+            send_retry++;
+            
+            if (send_retry < max_send_retries) {
+                LOG_WARNING("Session %zu: Failed to send heartbeat response: %d, retry %d/%d", 
+                           session_id_, static_cast<int>(send_err), send_retry, max_send_retries);
+                
+                // 添加短暂延迟后重试
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            } else {
+                LOG_WARNING("Session %zu: Failed to send heartbeat response after %d retries", 
+                          session_id_, max_send_retries);
+            }
+        }
+    }
+    
+    // 即使发送失败我们也标记为处理成功，因为心跳消息失败不应导致整个会话断开
+    return true;
+}
+
 // ServerCore实现
 ServerCore::ServerCore()
     : config_(),
       listen_socket_(nullptr),
       accept_thread_(),
       session_manager_thread_(),
-      running_(false),
-      sessions_(),
-      sessions_mutex_(),
-      stop_cv_(),
-      stop_mutex_() {
+      running_(false) {
 }
 
 ServerCore::~ServerCore() {
@@ -1199,92 +1175,72 @@ ServerCore::~ServerCore() {
 }
 
 bool ServerCore::initialize(const ServerConfig& config, utils::LogLevel log_level) {
+    // 初始化日志系统
+    if (!utils::Logger::instance().init(log_level)) {
+        std::cerr << "Failed to initialize logger" << std::endl;
+        return false;
+    }
+    
     config_ = config;
-    
-    // 初始化日志
-    utils::Logger::instance().init(log_level);
-    
-    // 设置静态存储路径
     storage_path_ = config.storage_path;
     
-    LOG_INFO("Server initializing with configuration:");
-    LOG_INFO("  Listen: %s:%d", config_.bind_address.c_str(), config_.port);
-    LOG_INFO("  Storage path: %s", config_.storage_path.c_str());
-    LOG_INFO("  Max connections: %d", config_.max_connections);
-    LOG_INFO("  Thread pool size: %d", config_.thread_pool_size);
-    
-    // 确保存储目录存在
-    fs::path storage_dir(config_.storage_path);
+    // 创建存储目录
     try {
-        if (!fs::exists(storage_dir)) {
-            LOG_INFO("Creating storage directory: %s", config_.storage_path.c_str());
-            fs::create_directories(storage_dir);
+        if (!fs::exists(storage_path_)) {
+            if (!fs::create_directories(storage_path_)) {
+                LOG_ERROR("Failed to create storage directory: %s", storage_path_.c_str());
+                return false;
+            }
         }
     } catch (const std::exception& e) {
-        LOG_ERROR("Failed to create storage directory: %s", e.what());
+        LOG_ERROR("Exception while creating storage directory: %s", e.what());
+        return false;
+    }
+    
+    // 初始化会话管理器
+    SessionManager::instance().set_max_sessions(config.max_connections);
+    
+    return true;
+}
+
+bool ServerCore::start() {
+    if (running_) {
+        LOG_WARNING("Server is already running");
         return false;
     }
     
     // 创建监听socket
     listen_socket_ = std::make_unique<network::TcpSocket>();
     
-    // 绑定地址和端口
+    // 应用socket选项，如地址重用等在TcpSocket构造函数中的SocketOptions中已设置
+    
+    // 绑定地址
     network::SocketError err = listen_socket_->bind(config_.bind_address, config_.port);
     if (err != network::SocketError::SUCCESS) {
-        LOG_ERROR("Failed to bind socket: %d", static_cast<int>(err));
+        LOG_ERROR("Failed to bind to %s:%d, error: %d", 
+                 config_.bind_address.c_str(), config_.port, static_cast<int>(err));
         return false;
     }
     
     // 开始监听
-    err = listen_socket_->listen(10);
+    err = listen_socket_->listen(config_.max_connections);
     if (err != network::SocketError::SUCCESS) {
-        LOG_ERROR("Failed to listen: %d", static_cast<int>(err));
+        LOG_ERROR("Failed to listen on %s:%d, error: %d", 
+                 config_.bind_address.c_str(), config_.port, static_cast<int>(err));
         return false;
     }
     
-    LOG_INFO("Server initialized successfully");
-    return true;
-}
-
-bool ServerCore::start() {
-    if (running_) {
-        LOG_WARNING("Server already running");
-        return true;
-    }
+    LOG_INFO("Server started on %s:%d", config_.bind_address.c_str(), config_.port);
     
-    // 检查socket是否已经初始化，如果没有，则创建
-    if (!listen_socket_ || listen_socket_->get_fd() < 0) {
-        // 创建监听socket
-        listen_socket_ = std::make_unique<network::TcpSocket>();
-        
-        // 绑定地址和端口
-        LOG_INFO("Binding to %s:%d...", config_.bind_address.c_str(), config_.port);
-        network::SocketError err = listen_socket_->bind(config_.bind_address, config_.port);
-        if (err != network::SocketError::SUCCESS) {
-            LOG_ERROR("Failed to bind socket: %d", static_cast<int>(err));
-            return false;
-        }
-        
-        // 开始监听
-        err = listen_socket_->listen(10);
-        if (err != network::SocketError::SUCCESS) {
-            LOG_ERROR("Failed to listen: %d", static_cast<int>(err));
-            return false;
-        }
-    }
-    
-    // 启动服务器
+    // 标记为运行状态
     running_ = true;
     
     // 启动接受连接线程
-    LOG_DEBUG("Starting accept thread...");
     accept_thread_ = std::thread(&ServerCore::accept_thread, this);
     
     // 启动会话管理线程
-    LOG_DEBUG("Starting session manager thread...");
     session_manager_thread_ = std::thread(&ServerCore::session_manager_thread, this);
     
-    LOG_INFO("Server started, listening on %s:%d", config_.bind_address.c_str(), config_.port);
     return true;
 }
 
@@ -1295,33 +1251,35 @@ void ServerCore::stop() {
     
     LOG_INFO("Stopping server...");
     
-    {
-        std::lock_guard<std::mutex> lock(stop_mutex_);
-        running_ = false;
-    }
+    // 标记停止状态
+    running_ = false;
     
-    // 关闭监听socket，这将使accept线程退出阻塞
+    // 关闭监听socket以中断accept
     if (listen_socket_) {
         listen_socket_->close();
+        listen_socket_.reset(); // 明确释放资源
     }
     
-    // 停止所有会话
-    {
-        std::lock_guard<std::mutex> lock(sessions_mutex_);
-        for (auto& session : sessions_) {
-            try {
-                if (session) {
-                    session->stop();
-                }
-            } catch (const std::exception& e) {
-                LOG_ERROR("Exception while stopping session: %s", e.what());
-            }
-        }
+    // 等待接受连接线程结束
+    if (accept_thread_.joinable()) {
+        accept_thread_.join();
     }
     
-    stop_cv_.notify_all();
+    // 等待会话管理线程结束
+    if (session_manager_thread_.joinable()) {
+        session_manager_thread_.join();
+    }
+    
+    // 关闭所有会话
+    SessionManager::instance().close_all_sessions();
     
     LOG_INFO("Server stopped");
+    
+    // 通知等待的线程
+    {
+        std::lock_guard<std::mutex> lock(stop_mutex_);
+        stop_cv_.notify_all();
+    }
 }
 
 bool ServerCore::is_running() const {
@@ -1329,155 +1287,65 @@ bool ServerCore::is_running() const {
 }
 
 void ServerCore::wait() {
-    // 等待服务器停止
     std::unique_lock<std::mutex> lock(stop_mutex_);
     stop_cv_.wait(lock, [this] { return !running_; });
-    
-    // 等待线程结束
-    if (accept_thread_.joinable()) {
-        LOG_DEBUG("Waiting for accept thread to finish...");
-        accept_thread_.join();
-    }
-    
-    if (session_manager_thread_.joinable()) {
-        LOG_DEBUG("Waiting for session manager thread to finish...");
-        session_manager_thread_.join();
-    }
-    
-    LOG_INFO("All server threads stopped");
+}
+
+size_t ServerCore::get_session_count() const {
+    return SessionManager::instance().get_session_count();
 }
 
 void ServerCore::accept_thread() {
     LOG_INFO("Accept thread started");
     
-    int consecutive_errors = 0;
-    const int max_consecutive_errors = 10;  // 允许的最大连续错误数
-    
     while (running_) {
-        try {
-            // 检查是否超过最大连接数
-            {
-                std::lock_guard<std::mutex> lock(sessions_mutex_);
-                if (sessions_.size() >= static_cast<size_t>(config_.max_connections)) {
-                    LOG_WARNING("Reached maximum connections: %d, waiting...", config_.max_connections);
-                    std::this_thread::sleep_for(std::chrono::seconds(1));
-                    continue;
-                }
+        // 创建临时socket接收新连接
+        network::TcpSocket client_socket;
+        
+        // 接受新的连接
+        network::SocketError err = listen_socket_->accept(client_socket);
+        if (err != network::SocketError::SUCCESS) {
+            if (running_) {
+                LOG_ERROR("Failed to accept connection, error: %d", static_cast<int>(err));
+                std::this_thread::sleep_for(std::chrono::seconds(1));
             }
-            
-            // 接受连接
-            network::TcpSocket client_socket;
-            network::SocketError err = listen_socket_->accept(client_socket);
-            if (err != network::SocketError::SUCCESS) {
-                if (err == network::SocketError::TIMEOUT) {
-                    // 超时是正常的，继续尝试
-                    std::this_thread::sleep_for(std::chrono::milliseconds(10));
-                    continue;
-                }
-                
-                // 其他错误，记录并重试
-                LOG_ERROR("Failed to accept connection: %d", static_cast<int>(err));
-                consecutive_errors++;
-                
-                if (consecutive_errors >= max_consecutive_errors) {
-                    LOG_ERROR("Too many consecutive accept errors, restarting listener...");
-                    // 尝试重新启动监听
-                    listen_socket_->close();
-                    std::this_thread::sleep_for(std::chrono::seconds(1));
-                    
-                    // 重新创建并绑定监听socket
-                    listen_socket_ = std::make_unique<network::TcpSocket>();
-                    err = listen_socket_->bind(config_.bind_address, config_.port);
-                    if (err != network::SocketError::SUCCESS) {
-                        LOG_ERROR("Failed to bind socket during recovery: %d", static_cast<int>(err));
-                        std::this_thread::sleep_for(std::chrono::seconds(5));
-                        continue;
-                    }
-                    
-                    err = listen_socket_->listen(10);
-                    if (err != network::SocketError::SUCCESS) {
-                        LOG_ERROR("Failed to listen socket during recovery: %d", static_cast<int>(err));
-                        std::this_thread::sleep_for(std::chrono::seconds(5));
-                        continue;
-                    }
-                    
-                    // 重置错误计数
-                    consecutive_errors = 0;
-                    LOG_INFO("Listener restarted successfully");
-                }
-                
-                std::this_thread::sleep_for(std::chrono::milliseconds(100));
-                continue;
-            }
-            
-            // 重置错误计数
-            consecutive_errors = 0;
-            
-            // 成功接受连接
-            LOG_INFO("Accepted connection from %s:%d", 
-                   client_socket.get_remote_address().c_str(), 
-                   client_socket.get_remote_port());
-            
-            // 记录客户端socket信息，用于调试
-            LOG_DEBUG("Client socket details - fd=%d, local=%s:%d, remote=%s:%d", 
-                     client_socket.get_fd(),
-                     client_socket.get_local_address().c_str(),
-                     client_socket.get_local_port(),
-                     client_socket.get_remote_address().c_str(), 
-                     client_socket.get_remote_port());
-            
-            // 确保连接状态正确
-            if (!client_socket.is_connected()) {
-                LOG_WARNING("Socket reported as not connected after accept, skipping");
-                continue;
-            }
-            
-            // 创建一个新的socket转移所有权，避免使用client_socket.get_fd()
-            std::unique_ptr<network::TcpSocket> socket_ptr = std::make_unique<network::TcpSocket>(std::move(client_socket));
-            
-            // 记录socket_ptr的当前状态
-            LOG_DEBUG("Socket after moving to unique_ptr - fd=%d, connected=%d, remote=%s:%d", 
-                     socket_ptr->get_fd(),
-                     socket_ptr->is_connected() ? 1 : 0,
-                     socket_ptr->get_remote_address().c_str(), 
-                     socket_ptr->get_remote_port());
-            
-            // 再次验证转移后的socket
-            if (!socket_ptr || !socket_ptr->is_connected()) {
-                LOG_ERROR("Socket lost connection during ownership transfer to unique_ptr, skipping");
-                continue;
-            }
-            
-            // 验证socket_ptr有效性
-            int socket_fd = socket_ptr->get_fd();
-            if (socket_fd < 0) {
-                LOG_ERROR("Invalid socket file descriptor after move: %d", socket_fd);
-                continue;
-            }
-            
-            // 创建客户端会话并启动
-            LOG_DEBUG("Creating ClientSession with socket_ptr - fd=%d", socket_fd);
-            std::shared_ptr<ClientSession> session = std::make_shared<ClientSession>(std::move(socket_ptr));
-            
-            // 检查session的socket现在是否还有效 - 这只是记录日志，无法直接访问内部socket
-            LOG_DEBUG("Created ClientSession - id=%zu, client=%s", 
-                     session->get_session_id(), 
-                     session->get_client_address().c_str());
-            
-            {
-                std::lock_guard<std::mutex> lock(sessions_mutex_);
-                sessions_.push_back(session);
-                LOG_INFO("Added new session, current sessions: %zu", sessions_.size());
-            }
-            
-            // 启动会话线程
-            LOG_DEBUG("Starting session %zu", session->get_session_id());
-            session->start();
-            
-        } catch (const std::exception& e) {
-            LOG_ERROR("Exception in accept thread: %s", e.what());
-            std::this_thread::sleep_for(std::chrono::seconds(1));
+            continue;
         }
+        
+        // 设置socket选项 - 减少超时时间以更快检测到断连
+        client_socket.set_recv_timeout(std::chrono::seconds(3));
+        client_socket.set_send_timeout(std::chrono::seconds(3));
+        
+        // 记录连接信息
+        LOG_INFO("New connection from %s:%d", 
+                 client_socket.get_remote_address().c_str(), 
+                 client_socket.get_remote_port());
+        
+        int socket_fd = client_socket.get_fd();
+        if (socket_fd < 0) {
+            LOG_ERROR("Invalid socket file descriptor: %d", socket_fd);
+            continue;
+        }
+        
+        // 创建客户端会话 - 使用移动构造函数转移socket所有权
+        LOG_DEBUG("Creating ClientSession with socket fd=%d", socket_fd);
+        std::shared_ptr<ClientSession> session = std::make_shared<ClientSession>(
+            std::make_unique<network::TcpSocket>(std::move(client_socket)));
+        
+        // 检查session的socket是否有效
+        LOG_DEBUG("Created ClientSession - id=%zu, client=%s", 
+                 session->get_session_id(), 
+                 session->get_client_address().c_str());
+        
+        // 使用会话管理器添加会话
+        if (SessionManager::instance().add_session(session) == 0) {
+            LOG_WARNING("Failed to add session to SessionManager, max sessions may be reached");
+            continue;
+        }
+        
+        // 启动会话线程
+        LOG_DEBUG("Starting session %zu", session->get_session_id());
+        session->start();
     }
     
     LOG_INFO("Accept thread exiting");
@@ -1487,53 +1355,14 @@ void ServerCore::session_manager_thread() {
     LOG_INFO("Session manager thread started");
     
     while (running_) {
-        try {
-            // 定时检查会话状态
-            std::this_thread::sleep_for(std::chrono::seconds(5));
-            
-            std::vector<std::shared_ptr<ClientSession>> active_sessions;
-            
-            {
-                std::lock_guard<std::mutex> lock(sessions_mutex_);
-                
-                // 筛选出活跃的会话
-                for (const auto& session : sessions_) {
-                    if (session && session->is_connected()) {
-                        active_sessions.push_back(session);
-                    }
-                }
-                
-                // 如果有会话被移除，则更新会话列表
-                if (active_sessions.size() != sessions_.size()) {
-                    LOG_INFO("Removed %zu inactive sessions", sessions_.size() - active_sessions.size());
-                    sessions_ = active_sessions;
-                }
-                
-                LOG_DEBUG("Current active sessions: %zu", sessions_.size());
-            }
-            
-        } catch (const std::exception& e) {
-            LOG_ERROR("Exception in session manager thread: %s", e.what());
-            std::this_thread::sleep_for(std::chrono::seconds(1));
-        }
+        // 定时清理过期会话
+        std::this_thread::sleep_for(std::chrono::seconds(5));
+        SessionManager::instance().clean_expired_sessions();
+        
+        LOG_DEBUG("Current active sessions: %zu", SessionManager::instance().get_session_count());
     }
     
     LOG_INFO("Session manager thread exiting");
-    
-    // 停止所有会话
-    {
-        std::lock_guard<std::mutex> lock(sessions_mutex_);
-        for (auto& session : sessions_) {
-            if (session) {
-                try {
-                    session->stop();
-                } catch (const std::exception& e) {
-                    LOG_ERROR("Exception while stopping session: %s", e.what());
-                }
-            }
-        }
-        sessions_.clear();
-    }
 }
 
 // 静态成员初始化

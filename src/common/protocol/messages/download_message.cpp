@@ -36,7 +36,9 @@ DownloadMessage::DownloadMessage(const Message& msg)
     
     // 检查操作类型
     if (get_operation_type() != OperationType::DOWNLOAD) {
-        throw std::runtime_error("Invalid operation type for DownloadMessage");
+        LOG_WARNING("Invalid operation type for DownloadMessage: %d", 
+                   static_cast<int>(get_operation_type()));
+        return;
     }
     
     // 反序列化

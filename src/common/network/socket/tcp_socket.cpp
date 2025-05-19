@@ -8,6 +8,7 @@
 #include <poll.h>
 #include <thread>
 #include <netinet/tcp.h>
+#include "../../utils/logging/logger.h"
 
 namespace ft {
 namespace network {
@@ -19,12 +20,15 @@ TcpSocket::TcpSocket(const SocketOptions& options)
       local_ip_(""),
       local_port_(0),
       remote_ip_(""),
-      remote_port_(0) {
+      remote_port_(0),
+      last_error_(SocketError::SUCCESS) {
     
     // 创建套接字
     sockfd_ = socket(AF_INET, SOCK_STREAM, 0);
     if (sockfd_ < 0) {
-        throw std::runtime_error("Failed to create socket");
+        last_error_ = SocketError::SOCKET_CREATE_FAILED;
+        LOG_ERROR("Failed to create socket: %s (errno=%d)", strerror(errno), errno);
+        return;
     }
     
     // 应用套接字选项
@@ -38,7 +42,8 @@ TcpSocket::TcpSocket(int sockfd, const SocketOptions& options)
       local_ip_(""),
       local_port_(0),
       remote_ip_(""),
-      remote_port_(0) {
+      remote_port_(0),
+      last_error_(SocketError::SUCCESS) {
     
     if (sockfd_ >= 0) {
         // 应用套接字选项
@@ -72,7 +77,7 @@ TcpSocket::TcpSocket(const TcpSocket& other)
         // 创建新的套接字
         sockfd_ = socket(AF_INET, SOCK_STREAM, 0);
         if (sockfd_ < 0) {
-            fprintf(stderr, "Failed to create socket in copy constructor: %s (errno=%d)\n", 
+            LOG_ERROR("Failed to create socket in copy constructor: %s (errno=%d)", 
                     strerror(errno), errno);
             return;
         }
@@ -82,7 +87,7 @@ TcpSocket::TcpSocket(const TcpSocket& other)
         
         // 注意：复制构造函数不会复制连接状态，因为我们无法复制底层连接
         // 这里不会自动连接到相同的远程主机，需要调用者手动重新连接
-        fprintf(stderr, "Socket copied but not connected. Call connect() to establish connection.\n");
+        LOG_WARNING("Socket copied but not connected. Call connect() to establish connection.");
     }
 }
 
@@ -107,7 +112,7 @@ TcpSocket& TcpSocket::operator=(const TcpSocket& other) {
             // 创建新的套接字
             sockfd_ = socket(AF_INET, SOCK_STREAM, 0);
             if (sockfd_ < 0) {
-                fprintf(stderr, "Failed to create socket in assignment operator: %s (errno=%d)\n", 
+                LOG_ERROR("Failed to create socket in assignment operator: %s (errno=%d)", 
                         strerror(errno), errno);
                 return *this;
             }
@@ -116,7 +121,7 @@ TcpSocket& TcpSocket::operator=(const TcpSocket& other) {
             apply_socket_options();
             
             // 注意：赋值操作不会复制连接状态
-            fprintf(stderr, "Socket assigned but not connected. Call connect() to establish connection.\n");
+            LOG_WARNING("Socket assigned but not connected. Call connect() to establish connection.");
         }
     }
     return *this;
@@ -132,9 +137,8 @@ TcpSocket::TcpSocket(TcpSocket&& other) noexcept
       remote_port_(other.remote_port_) {
     
     // 添加详细的移动构造函数日志
-    fprintf(stderr, "TcpSocket move constructor: Moving fd=%d, connected=%d, remote=%s:%d to new object [%p->%p]\n", 
-            sockfd_, connected_ ? 1 : 0, remote_ip_.c_str(), remote_port_, 
-            static_cast<void*>(&other), static_cast<void*>(this));
+    LOG_DEBUG("TcpSocket move constructor: Moving fd=%d, connected=%d, remote=%s:%d", 
+            sockfd_, connected_ ? 1 : 0, remote_ip_.c_str(), remote_port_);
     
     // 防止源对象析构时关闭socket
     int old_fd = other.sockfd_;
@@ -143,7 +147,7 @@ TcpSocket::TcpSocket(TcpSocket&& other) noexcept
     other.local_port_ = 0;
     other.remote_port_ = 0;
     
-    fprintf(stderr, "TcpSocket move constructor: Source fd changed from %d to %d\n", old_fd, other.sockfd_);
+    LOG_DEBUG("TcpSocket move constructor: Source fd changed from %d to %d", old_fd, other.sockfd_);
 }
 
 TcpSocket& TcpSocket::operator=(TcpSocket&& other) noexcept {
@@ -151,7 +155,7 @@ TcpSocket& TcpSocket::operator=(TcpSocket&& other) noexcept {
         // 关闭现有套接字
         int old_fd = sockfd_;
         if (sockfd_ >= 0) {
-            fprintf(stderr, "TcpSocket move assignment: Closing existing socket fd=%d\n", sockfd_);
+            LOG_DEBUG("TcpSocket move assignment: Closing existing socket fd=%d", sockfd_);
             ::close(sockfd_);
         }
       
@@ -165,9 +169,8 @@ TcpSocket& TcpSocket::operator=(TcpSocket&& other) noexcept {
         remote_port_ = other.remote_port_;
         
         // 添加详细的移动赋值运算符日志
-        fprintf(stderr, "TcpSocket move assignment: Changed fd from %d to %d, connected=%d, remote=%s:%d [%p->%p]\n", 
-                old_fd, sockfd_, connected_ ? 1 : 0, remote_ip_.c_str(), remote_port_, 
-                static_cast<void*>(&other), static_cast<void*>(this));
+        LOG_DEBUG("TcpSocket move assignment: Changed fd from %d to %d, connected=%d, remote=%s:%d", 
+                old_fd, sockfd_, connected_ ? 1 : 0, remote_ip_.c_str(), remote_port_);
         
         // 防止源对象析构时关闭socket
         int old_other_fd = other.sockfd_;
@@ -176,7 +179,7 @@ TcpSocket& TcpSocket::operator=(TcpSocket&& other) noexcept {
         other.local_port_ = 0;
         other.remote_port_ = 0;
         
-        fprintf(stderr, "TcpSocket move assignment: Source fd changed from %d to %d\n", old_other_fd, other.sockfd_);
+        LOG_DEBUG("TcpSocket move assignment: Source fd changed from %d to %d", old_other_fd, other.sockfd_);
     }
     return *this;
 }
@@ -233,24 +236,22 @@ SocketError TcpSocket::accept(TcpSocket& client_socket) {
     
     struct sockaddr_in addr;
     socklen_t addr_len = sizeof(addr);
-    fprintf(stderr, "Accepting connections on %s:%d (fd=%d)...\n", 
-            local_ip_.c_str(), local_port_, sockfd_);
+    LOG_INFO("Accepting connections on %s:%d (fd=%d)", local_ip_.c_str(), local_port_, sockfd_);
             
     int client_fd = ::accept(sockfd_, (struct sockaddr*)&addr, &addr_len);
     if (client_fd < 0) {
-        fprintf(stderr, "Accept failed: %s (errno=%d)\n", strerror(errno), errno);
+        LOG_ERROR("Accept failed: %s (errno=%d)", strerror(errno), errno);
         return SocketError::ACCEPT_FAILED;
     }
     
-    fprintf(stderr, "Accepted connection, new socket fd=%d\n", client_fd);
+    LOG_INFO("Accepted connection, new socket fd=%d", client_fd);
     
     // 设置TCP选项，确保客户端连接的可靠性
     
     // 禁用Nagle算法
     int flag = 1;
     if (setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag)) < 0) {
-        fprintf(stderr, "Warning: Failed to set TCP_NODELAY on client socket: %s (errno=%d)\n", 
-                strerror(errno), errno);
+        LOG_WARNING("Warning: Failed to set TCP_NODELAY on client socket: %s (errno=%d)", strerror(errno), errno);
         // 继续执行，这不是致命错误
     }
     
@@ -262,29 +263,25 @@ SocketError TcpSocket::accept(TcpSocket& client_socket) {
     
     // 启用保活
     if (setsockopt(client_fd, SOL_SOCKET, SO_KEEPALIVE, &keepalive, sizeof(keepalive)) < 0) {
-        fprintf(stderr, "Warning: Failed to set SO_KEEPALIVE on client socket: %s (errno=%d)\n", 
-                strerror(errno), errno);
+        LOG_WARNING("Warning: Failed to set SO_KEEPALIVE on client socket: %s (errno=%d)", strerror(errno), errno);
     }
     
     // 设置保活参数 (仅适用于Linux系统)
 #ifdef TCP_KEEPIDLE
     if (setsockopt(client_fd, IPPROTO_TCP, TCP_KEEPIDLE, &keepidle, sizeof(keepidle)) < 0) {
-        fprintf(stderr, "Warning: Failed to set TCP_KEEPIDLE on client socket: %s (errno=%d)\n", 
-                strerror(errno), errno);
+        LOG_WARNING("Warning: Failed to set TCP_KEEPIDLE on client socket: %s (errno=%d)", strerror(errno), errno);
     }
 #endif
 
 #ifdef TCP_KEEPINTVL
     if (setsockopt(client_fd, IPPROTO_TCP, TCP_KEEPINTVL, &keepintvl, sizeof(keepintvl)) < 0) {
-        fprintf(stderr, "Warning: Failed to set TCP_KEEPINTVL on client socket: %s (errno=%d)\n", 
-                strerror(errno), errno);
+        LOG_WARNING("Warning: Failed to set TCP_KEEPINTVL on client socket: %s (errno=%d)", strerror(errno), errno);
     }
 #endif
 
 #ifdef TCP_KEEPCNT
     if (setsockopt(client_fd, IPPROTO_TCP, TCP_KEEPCNT, &keepcnt, sizeof(keepcnt)) < 0) {
-        fprintf(stderr, "Warning: Failed to set TCP_KEEPCNT on client socket: %s (errno=%d)\n", 
-                strerror(errno), errno);
+        LOG_WARNING("Warning: Failed to set TCP_KEEPCNT on client socket: %s (errno=%d)", strerror(errno), errno);
     }
 #endif
     
@@ -293,17 +290,14 @@ SocketError TcpSocket::accept(TcpSocket& client_socket) {
     uint16_t client_port;
     get_socket_address(addr, client_ip, client_port);
     
-    fprintf(stderr, "Client connection details - address=%s:%d\n", client_ip.c_str(), client_port);
+    LOG_INFO("Client connection details - address=%s:%d", client_ip.c_str(), client_port);
     
     // 关闭客户端套接字现有的fd，防止资源泄漏
-    fprintf(stderr, "Closing client_socket existing fd=%d before assigning new fd=%d\n", 
-            client_socket.sockfd_, client_fd);
+    LOG_INFO("Closing client_socket existing fd=%d before assigning new fd=%d", client_socket.sockfd_, client_fd);
     client_socket.close();
     
     // 记录当前客户端socket状态
-    fprintf(stderr, "Before assignment - client_socket: fd=%d, connected=%d, remote=%s:%d\n",
-            client_socket.sockfd_, client_socket.connected_ ? 1 : 0, 
-            client_socket.remote_ip_.c_str(), client_socket.remote_port_);
+    LOG_INFO("Before assignment - client_socket: fd=%d, connected=%d, remote=%s:%d", client_socket.sockfd_, client_socket.connected_ ? 1 : 0, client_socket.remote_ip_.c_str(), client_socket.remote_port_);
     
     // 使用移动构造创建新的TcpSocket临时对象，然后赋值给客户端套接字
     // 这样可以确保所有状态被正确初始化
@@ -320,521 +314,580 @@ SocketError TcpSocket::accept(TcpSocket& client_socket) {
     client_socket = std::move(temp_socket);
     
     // 验证客户端套接字状态
-    fprintf(stderr, "After assignment - client_socket: fd=%d, connected=%d, remote=%s:%d\n",
-            client_socket.sockfd_, client_socket.connected_ ? 1 : 0, 
-            client_socket.remote_ip_.c_str(), client_socket.remote_port_);
+    LOG_INFO("After assignment - client_socket: fd=%d, connected=%d, remote=%s:%d", client_socket.sockfd_, client_socket.connected_ ? 1 : 0, client_socket.remote_ip_.c_str(), client_socket.remote_port_);
     
     // 验证客户端套接字是否仍然连接
     if (!client_socket.is_connected()) {
-        fprintf(stderr, "Warning: Client socket not connected after accept and assignment\n");
+        LOG_WARNING("Warning: Client socket not connected after accept and assignment");
     } else {
-        fprintf(stderr, "Client socket successfully connected and assigned\n");
+        LOG_INFO("Client socket successfully connected and assigned");
     }
     
-    fprintf(stderr, "Accepted connection from %s:%d on socket fd=%d\n", 
-            client_ip.c_str(), client_port, client_socket.sockfd_);
+    LOG_INFO("Accepted connection from %s:%d on socket fd=%d", client_ip.c_str(), client_port, client_socket.sockfd_);
     
     return SocketError::SUCCESS;
 }
 
 SocketError TcpSocket::connect(const std::string& host, uint16_t port) {
     if (sockfd_ < 0) {
-        return SocketError::INVALID_STATE;
+        last_error_ = SocketError::INVALID_STATE;
+        LOG_ERROR("connect: Invalid socket state");
+        return last_error_;
     }
     
+    // 如果已经连接，先关闭现有连接
+    if (connected_) {
+        close();
+        
+        // 重新创建socket
+        sockfd_ = socket(AF_INET, SOCK_STREAM, 0);
+        if (sockfd_ < 0) {
+            last_error_ = SocketError::SOCKET_CREATE_FAILED;
+            LOG_ERROR("connect: Failed to create new socket: %s (errno=%d)",
+                   strerror(errno), errno);
+            return last_error_;
+        }
+        
+        // 应用套接字选项
+        apply_socket_options();
+    }
+    
+    // 解析服务器地址
     struct sockaddr_in addr;
     std::memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
     addr.sin_port = htons(port);
     
-    if (inet_pton(AF_INET, host.c_str(), &addr.sin_addr) <= 0) {
-        // 尝试解析主机名
+    // 尝试将主机名解析为IP地址
+    if (inet_pton(AF_INET, host.c_str(), &addr.sin_addr) != 1) {
+        // 如果不是IP地址，尝试通过域名解析
         struct hostent* he = gethostbyname(host.c_str());
         if (!he) {
-            return SocketError::INVALID_ARGUMENT;
+            last_error_ = SocketError::CONNECT_FAILED;
+            LOG_ERROR("connect: Failed to resolve hostname %s: %s (h_errno=%d)",
+                   host.c_str(), hstrerror(h_errno), h_errno);
+            return last_error_;
         }
-        std::memcpy(&addr.sin_addr, he->h_addr_list[0], he->h_length);
+        
+        // 复制解析出的地址
+        std::memcpy(&addr.sin_addr, he->h_addr, he->h_length);
     }
     
-    // 可能需要关闭原有套接字并重新创建，确保清洁的TCP连接
-    if (sockfd_ >= 0) {
-        ::close(sockfd_);
-    }
+    // 设置为非阻塞模式进行连接
+    int flags = fcntl(sockfd_, F_GETFL, 0);
+    fcntl(sockfd_, F_SETFL, flags | O_NONBLOCK);
     
-    // 重新创建套接字
-    sockfd_ = socket(AF_INET, SOCK_STREAM, 0);
-    if (sockfd_ < 0) {
-        fprintf(stderr, "Failed to create socket: %s (errno=%d)\n", strerror(errno), errno);
-        return SocketError::SOCKET_CREATE_FAILED;
-    }
-    
-    // 重新应用套接字选项
-    apply_socket_options();
-    
-    // 设置非阻塞模式进行连接，以支持超时
-    bool orig_non_blocking = options_.non_blocking;
-    set_non_blocking(true);
-    
-    fprintf(stderr, "Connecting to %s:%d (fd=%d)...\n", host.c_str(), port, sockfd_);
+    // 尝试连接
     int ret = ::connect(sockfd_, (struct sockaddr*)&addr, sizeof(addr));
-    if (ret < 0 && errno != EINPROGRESS) {
-        fprintf(stderr, "Connect failed: %s (errno=%d)\n", strerror(errno), errno);
-        set_non_blocking(orig_non_blocking);
-        return SocketError::CONNECT_FAILED;
-    }
     
-    // 等待连接完成或超时
-    if (ret < 0 && errno == EINPROGRESS) {
+    // 连接立即成功或者正在进行中
+    if (ret == 0 || (ret < 0 && errno == EINPROGRESS)) {
+        // 使用poll等待连接完成
         struct pollfd pfd;
         pfd.fd = sockfd_;
         pfd.events = POLLOUT;
         pfd.revents = 0;
         
-        fprintf(stderr, "Waiting for connection to complete (timeout=%ld ms)...\n", 
-                options_.connect_timeout.count());
-                
-        int poll_ret = poll(&pfd, 1, options_.connect_timeout.count());
-        if (poll_ret <= 0) {
-            set_non_blocking(orig_non_blocking);
-            if (poll_ret == 0) {
-                fprintf(stderr, "Connect timeout after %ld ms\n", options_.connect_timeout.count());
-                return SocketError::TIMEOUT;
-            } else {
-                fprintf(stderr, "Poll failed during connect: %s (errno=%d)\n", 
-                        strerror(errno), errno);
-                return SocketError::CONNECT_FAILED;
-            }
-        }
+        // 转换超时时间为毫秒
+        int timeout_ms = static_cast<int>(options_.connect_timeout.count());
         
-        // 检查连接是否成功
-        int error = 0;
-        socklen_t len = sizeof(error);
-        if (getsockopt(sockfd_, SOL_SOCKET, SO_ERROR, &error, &len) < 0 || error) {
-            fprintf(stderr, "Failed to get socket options: %s (errno=%d)\n", 
-                    error ? strerror(error) : strerror(errno), error ? error : errno);
-            set_non_blocking(orig_non_blocking);
-            return SocketError::CONNECT_FAILED;
+        // 等待连接完成或者超时
+        ret = poll(&pfd, 1, timeout_ms);
+        
+        // 恢复为阻塞模式
+        fcntl(sockfd_, F_SETFL, flags);
+        
+        if (ret < 0) {
+            // poll系统调用出错
+            last_error_ = SocketError::CONNECT_FAILED;
+            LOG_ERROR("connect: poll error during connect: %s (errno=%d)",
+                   strerror(errno), errno);
+            return last_error_;
+        } else if (ret == 0) {
+            // 连接超时
+            last_error_ = SocketError::TIMEOUT;
+            LOG_ERROR("connect: Timeout connecting to %s:%d", host.c_str(), port);
+            return last_error_;
+        } else {
+            // 检查socket是否有错误
+            if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) {
+                // 获取具体错误
+                int err;
+                socklen_t err_len = sizeof(err);
+                getsockopt(sockfd_, SOL_SOCKET, SO_ERROR, &err, &err_len);
+                
+                last_error_ = SocketError::CONNECT_FAILED;
+                LOG_ERROR("connect: Failed to connect to %s:%d: %s (errno=%d)",
+                       host.c_str(), port, strerror(err), err);
+                return last_error_;
+            }
+            
+            // 连接成功
+            connected_ = true;
+            remote_ip_ = host;
+            remote_port_ = port;
+            
+            // 获取本地地址
+            struct sockaddr_in local_addr;
+            socklen_t addr_len = sizeof(local_addr);
+            if (getsockname(sockfd_, (struct sockaddr*)&local_addr, &addr_len) == 0) {
+                char ip_buf[INET_ADDRSTRLEN];
+                inet_ntop(AF_INET, &local_addr.sin_addr, ip_buf, sizeof(ip_buf));
+                local_ip_ = ip_buf;
+                local_port_ = ntohs(local_addr.sin_port);
+            }
+            
+            LOG_INFO("Connected to %s:%d from local %s:%d", 
+                     host.c_str(), port, local_ip_.c_str(), local_port_);
+            
+            last_error_ = SocketError::SUCCESS;
+            return last_error_;
         }
-    }
-    
-    // 恢复原始的阻塞模式
-    set_non_blocking(orig_non_blocking);
-    
-    // 设置TCP_NODELAY选项，禁用Nagle算法，减少延迟
-    int flag = 1;
-    if (setsockopt(sockfd_, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag)) < 0) {
-        fprintf(stderr, "Warning: Failed to set TCP_NODELAY: %s (errno=%d)\n", 
-                strerror(errno), errno);
-        // 继续执行，这不是致命错误
-    }
-    
-    // 设置TCP保活选项，更早检测断开的连接
-    int keepalive = 1;
-    int keepidle = 10;   // 10秒无数据传输就开始发送保活包
-    int keepintvl = 1;   // 每1秒发送一次保活包
-    int keepcnt = 3;     // 最多发送3次保活包
-    
-    // 启用保活
-    if (setsockopt(sockfd_, SOL_SOCKET, SO_KEEPALIVE, &keepalive, sizeof(keepalive)) < 0) {
-        fprintf(stderr, "Warning: Failed to set SO_KEEPALIVE: %s (errno=%d)\n", 
-                strerror(errno), errno);
-    }
-    
-    // 设置保活参数 (仅适用于Linux系统)
-#ifdef TCP_KEEPIDLE
-    if (setsockopt(sockfd_, IPPROTO_TCP, TCP_KEEPIDLE, &keepidle, sizeof(keepidle)) < 0) {
-        fprintf(stderr, "Warning: Failed to set TCP_KEEPIDLE: %s (errno=%d)\n", 
-                strerror(errno), errno);
-    }
-#endif
-
-#ifdef TCP_KEEPINTVL
-    if (setsockopt(sockfd_, IPPROTO_TCP, TCP_KEEPINTVL, &keepintvl, sizeof(keepintvl)) < 0) {
-        fprintf(stderr, "Warning: Failed to set TCP_KEEPINTVL: %s (errno=%d)\n", 
-                strerror(errno), errno);
-    }
-#endif
-
-#ifdef TCP_KEEPCNT
-    if (setsockopt(sockfd_, IPPROTO_TCP, TCP_KEEPCNT, &keepcnt, sizeof(keepcnt)) < 0) {
-        fprintf(stderr, "Warning: Failed to set TCP_KEEPCNT: %s (errno=%d)\n", 
-                strerror(errno), errno);
-    }
-#endif
-    
-    // 保存远程地址信息
-    remote_ip_ = host;
-    remote_port_ = port;
-    connected_ = true;
-    
-    // 获取本地地址信息
-    struct sockaddr_in local_addr;
-    socklen_t addr_len = sizeof(local_addr);
-    if (getsockname(sockfd_, (struct sockaddr*)&local_addr, &addr_len) == 0) {
-        get_socket_address(local_addr, local_ip_, local_port_);
-        fprintf(stderr, "Connected to %s:%d from local %s:%d (fd=%d)\n", 
-                remote_ip_.c_str(), remote_port_, local_ip_.c_str(), local_port_, sockfd_);
     } else {
-        fprintf(stderr, "Warning: Failed to get local address: %s (errno=%d)\n", 
-                strerror(errno), errno);
-        fprintf(stderr, "Connected to %s:%d (fd=%d)\n", 
-                remote_ip_.c_str(), remote_port_, sockfd_);
+        // 恢复为阻塞模式
+        fcntl(sockfd_, F_SETFL, flags);
+        
+        last_error_ = SocketError::CONNECT_FAILED;
+        LOG_ERROR("connect: Failed to connect to %s:%d: %s (errno=%d)",
+               host.c_str(), port, strerror(errno), errno);
+        return last_error_;
     }
-    
-    return SocketError::SUCCESS;
 }
 
 SocketError TcpSocket::send(const void* data, size_t len, size_t& sent_len) {
     if (sockfd_ < 0) {
+        last_error_ = SocketError::INVALID_STATE;
         return SocketError::INVALID_STATE;
     }
     
     if (!data || len == 0) {
-        sent_len = 0;
-        return SocketError::SUCCESS;
+        last_error_ = SocketError::INVALID_ARGUMENT;
+        return SocketError::INVALID_ARGUMENT;
     }
     
-    // 首先检查套接字是否仍然连接
-    if (!check_connection_state_()) {
-        fprintf(stderr, "Socket is not connected (fd=%d)\n", sockfd_);
+    // 检查连接状态
+    if (!connected_) {
+        last_error_ = SocketError::CLOSED;
         return SocketError::CLOSED;
     }
     
-    // 等待套接字可写
-    if (!options_.non_blocking) {
+    // 非阻塞发送，支持超时
+    if (options_.non_blocking || options_.send_timeout.count() > 0) {
         struct pollfd pfd;
         pfd.fd = sockfd_;
         pfd.events = POLLOUT;
-        pfd.revents = 0;
         
         int poll_ret = poll(&pfd, 1, options_.send_timeout.count());
-        if (poll_ret <= 0) {
-            if (poll_ret == 0) {
-                return SocketError::TIMEOUT;
-            } else {
-                fprintf(stderr, "Poll failed with error: %s (errno=%d)\n", strerror(errno), errno);
-                return SocketError::SEND_FAILED;
-            }
+        if (poll_ret == 0) {
+            // 发送超时
+            last_error_ = SocketError::TIMEOUT;
+            return SocketError::TIMEOUT;
+        } else if (poll_ret < 0) {
+            // Poll错误
+            last_error_ = SocketError::SEND_FAILED;
+            return SocketError::SEND_FAILED;
         }
         
-        // 检查套接字状态
-        if ((pfd.revents & POLLERR) || (pfd.revents & POLLHUP) || (pfd.revents & POLLNVAL)) {
-            int error = 0;
-            socklen_t len = sizeof(error);
-            getsockopt(sockfd_, SOL_SOCKET, SO_ERROR, &error, &len);
-            fprintf(stderr, "Socket error during poll: %s (errno=%d)\n", strerror(error), error);
-            if (pfd.revents & POLLHUP) {
-                connected_ = false;  // 更新连接状态
+        // 检查套接字是否可写
+        if (!(pfd.revents & POLLOUT)) {
+            if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) {
+                // 连接关闭或错误
+                connected_ = false;
+                last_error_ = SocketError::CLOSED;
                 return SocketError::CLOSED;
             }
-            return SocketError::SEND_FAILED;
-        }
-        
-        if (!(pfd.revents & POLLOUT)) {
-            fprintf(stderr, "Socket is not writable\n");
+            // 其他错误
+            last_error_ = SocketError::SEND_FAILED;
             return SocketError::SEND_FAILED;
         }
     }
     
-    // 发送数据
+    // 尝试发送数据
     ssize_t ret = ::send(sockfd_, data, len, 0);
     if (ret < 0) {
-        fprintf(stderr, "Send failed: %s (errno=%d)\n", strerror(errno), errno);
-        if (errno == EPIPE || errno == ECONNRESET) {
-            connected_ = false;  // 更新连接状态
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            // 资源暂时不可用，可以重试
+            sent_len = 0;
+            last_error_ = SocketError::TIMEOUT;
+            return SocketError::TIMEOUT;
+        } else if (errno == EPIPE || errno == ECONNRESET) {
+            // 连接已关闭
+            connected_ = false;
+            last_error_ = SocketError::CLOSED;
             return SocketError::CLOSED;
+        } else {
+            // 其他发送错误
+            last_error_ = SocketError::SEND_FAILED;
+            return SocketError::SEND_FAILED;
         }
-        return SocketError::SEND_FAILED;
     }
     
+    // 成功发送
     sent_len = static_cast<size_t>(ret);
+    last_error_ = SocketError::SUCCESS;
     return SocketError::SUCCESS;
 }
 
 SocketError TcpSocket::recv(void* buffer, size_t len, size_t& received_len) {
     if (sockfd_ < 0) {
+        last_error_ = SocketError::INVALID_STATE;
         return SocketError::INVALID_STATE;
     }
     
     if (!buffer || len == 0) {
-        received_len = 0;
-        return SocketError::SUCCESS;
+        last_error_ = SocketError::INVALID_ARGUMENT;
+        return SocketError::INVALID_ARGUMENT;
     }
     
-    // 首先检查套接字是否仍然连接
-    if (!check_connection_state_()) {
-        fprintf(stderr, "Socket is not connected (fd=%d)\n", sockfd_);
+    // 检查连接状态
+    if (!connected_) {
+        last_error_ = SocketError::CLOSED;
         return SocketError::CLOSED;
     }
     
-    // 等待套接字可读
-    if (!options_.non_blocking) {
+    // 非阻塞接收，支持超时
+    if (options_.non_blocking || options_.recv_timeout.count() > 0) {
         struct pollfd pfd;
         pfd.fd = sockfd_;
         pfd.events = POLLIN;
-        pfd.revents = 0;
         
         int poll_ret = poll(&pfd, 1, options_.recv_timeout.count());
-        if (poll_ret <= 0) {
-            if (poll_ret == 0) {
-                fprintf(stderr, "Socket recv timeout after %ld ms\n", 
-                        options_.recv_timeout.count());
-                return SocketError::TIMEOUT;
-            } else {
-                fprintf(stderr, "Poll failed with error: %s (errno=%d)\n", strerror(errno), errno);
-                return SocketError::RECV_FAILED;
-            }
-        }
-        
-        // 检查套接字状态
-        if ((pfd.revents & POLLERR) || (pfd.revents & POLLHUP) || (pfd.revents & POLLNVAL)) {
-            int error = 0;
-            socklen_t len = sizeof(error);
-            getsockopt(sockfd_, SOL_SOCKET, SO_ERROR, &error, &len);
-            fprintf(stderr, "Socket error during poll: %s (errno=%d)\n", strerror(error), error);
-            
-            if (pfd.revents & POLLHUP) {
-                connected_ = false;  // 标记连接已断开
-                fprintf(stderr, "Socket recv detected POLLHUP, connection closed\n");
-                return SocketError::CLOSED;
-            }
-            
-            if (pfd.revents & POLLNVAL) {
-                fprintf(stderr, "Socket recv detected POLLNVAL, invalid socket descriptor\n");
-                connected_ = false;
-                sockfd_ = -1;  // 无效的套接字描述符
-                return SocketError::INVALID_STATE;
-            }
-            
+        if (poll_ret == 0) {
+            // 接收超时
+            received_len = 0;
+            last_error_ = SocketError::TIMEOUT;
+            return SocketError::TIMEOUT;
+        } else if (poll_ret < 0) {
+            // Poll错误
+            last_error_ = SocketError::RECV_FAILED;
             return SocketError::RECV_FAILED;
         }
         
+        // 检查套接字是否可读
         if (!(pfd.revents & POLLIN)) {
-            fprintf(stderr, "Socket is not readable\n");
+            if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) {
+                // 连接关闭或错误
+                connected_ = false;
+                last_error_ = SocketError::CLOSED;
+                return SocketError::CLOSED;
+            }
+            // 其他错误
+            last_error_ = SocketError::RECV_FAILED;
             return SocketError::RECV_FAILED;
         }
     }
     
-    // 接收数据
+    // 尝试接收数据
     ssize_t ret = ::recv(sockfd_, buffer, len, 0);
     if (ret < 0) {
-        fprintf(stderr, "Recv failed: %s (errno=%d)\n", strerror(errno), errno);
-        
-        if (errno == ECONNRESET || errno == EPIPE || errno == EBADF || errno == ENOTCONN) {
-            connected_ = false;  // 标记连接已断开
-            
-            if (errno == EBADF) {
-                sockfd_ = -1;  // 无效的套接字描述符
-            }
-            
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            // 资源暂时不可用，可以重试
+            received_len = 0;
+            last_error_ = SocketError::TIMEOUT;
+            return SocketError::TIMEOUT;
+        } else if (errno == ECONNRESET) {
+            // 连接已重置
+            connected_ = false;
+            last_error_ = SocketError::CLOSED;
             return SocketError::CLOSED;
+        } else {
+            // 其他接收错误
+            last_error_ = SocketError::RECV_FAILED;
+            return SocketError::RECV_FAILED;
         }
-        
-        return SocketError::RECV_FAILED;
     } else if (ret == 0) {
-        // 连接对方已关闭
-        fprintf(stderr, "Recv returned 0 bytes, connection closed by peer\n");
+        // 对端关闭连接
         connected_ = false;
+        last_error_ = SocketError::CLOSED;
         return SocketError::CLOSED;
     }
     
+    // 成功接收
     received_len = static_cast<size_t>(ret);
+    last_error_ = SocketError::SUCCESS;
     return SocketError::SUCCESS;
 }
 
 SocketError TcpSocket::send_all(const void* data, size_t len) {
     if (sockfd_ < 0) {
-        return SocketError::INVALID_STATE;
+        last_error_ = SocketError::INVALID_STATE;
+        return last_error_;
     }
     
     if (!data || len == 0) {
-        return SocketError::SUCCESS;
+        last_error_ = SocketError::INVALID_ARGUMENT;
+        return last_error_;
     }
     
-    // 先验证连接状态
-    if (!check_connection_state_()) {
-        fprintf(stderr, "Socket send_all failed: Socket not connected\n");
-        return SocketError::CLOSED;
-    }
-    
-    const char* ptr = static_cast<const char*>(data);
-    size_t remaining = len;
+    // 使用偏移量跟踪已发送的数据
     size_t total_sent = 0;
+    const uint8_t* buffer = static_cast<const uint8_t*>(data);
     
-    // 添加轻量级连接检查
-    struct pollfd check_pfd;
-    check_pfd.fd = sockfd_;
-    check_pfd.events = POLLOUT;
-    check_pfd.revents = 0;
+    // 记录开始时间用于超时检测
+    auto start_time = std::chrono::steady_clock::now();
+    auto current_time = start_time;
     
-    // 检查socket是否可写
-    int check_poll_ret = poll(&check_pfd, 1, 0);
-    if (check_poll_ret > 0) {
-        if ((check_pfd.revents & POLLERR) || 
-            (check_pfd.revents & POLLHUP) || 
-            (check_pfd.revents & POLLNVAL)) {
-            int error = 0;
-            socklen_t len = sizeof(error);
-            getsockopt(sockfd_, SOL_SOCKET, SO_ERROR, &error, &len);
-            fprintf(stderr, "Socket send check detected error: %s (errno=%d)\n", 
-                   strerror(error), error);
-            
-            connected_ = false;
-            return SocketError::SEND_FAILED;
-        }
-    }
+    // 计算总超时时间 (原超时时间的1.5倍，考虑到重试)
+    auto total_timeout_ms = options_.send_timeout.count() * 1.5;
     
-    while (remaining > 0) {
-        size_t sent = 0;
-        SocketError err = send(ptr, remaining, sent);
-        if (err != SocketError::SUCCESS) {
-            fprintf(stderr, "Socket send_all failed at %zu/%zu bytes: error %d\n", 
-                   total_sent, len, static_cast<int>(err));
-            
-            // 在发送中途失败，标记连接状态
-            if (err == SocketError::CLOSED) {
-                connected_ = false;
-            }
-            
-            return err;
+    // 最大重试次数和延迟
+    const int max_retries = 3;
+    int retry_count = 0;
+    
+    while (total_sent < len) {
+        // 计算当前已用时间
+        current_time = std::chrono::steady_clock::now();
+        auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            current_time - start_time).count();
+        
+        // 检查是否超时
+        if (elapsed_ms > total_timeout_ms) {
+            last_error_ = SocketError::TIMEOUT;
+            LOG_ERROR("send_all timeout after %lld ms", elapsed_ms);
+            return last_error_;
         }
         
-        ptr += sent;
-        remaining -= sent;
+        // 检查socket是否有效
+        if (sockfd_ < 0 || !connected_) {
+            last_error_ = SocketError::INVALID_STATE;
+            LOG_ERROR("send_all: socket not connected");
+            return last_error_;
+        }
+        
+        // 检查socket是否可写
+        struct pollfd pfd;
+        pfd.fd = sockfd_;
+        pfd.events = POLLOUT;
+        pfd.revents = 0;
+        
+        // 计算剩余超时时间
+        int remaining_timeout_ms = static_cast<int>(total_timeout_ms - elapsed_ms);
+        if (remaining_timeout_ms < 0) remaining_timeout_ms = 0;
+        
+        int poll_result = poll(&pfd, 1, remaining_timeout_ms);
+        
+        if (poll_result < 0) {
+            // 系统调用被中断，这是可以恢复的，直接继续
+            if (errno == EINTR) {
+                continue;
+            }
+            
+            // 其他不可恢复错误
+            last_error_ = SocketError::SEND_FAILED;
+            LOG_ERROR("send_all: poll failed: %s (errno=%d)", strerror(errno), errno);
+            return last_error_;
+        } else if (poll_result == 0) {
+            // poll超时，但总时间可能还没到
+            retry_count++;
+            
+            if (retry_count > max_retries) {
+                last_error_ = SocketError::TIMEOUT;
+                LOG_ERROR("send_all: poll timeout after %d retries", max_retries);
+                return last_error_;
+            }
+            
+            // 短暂休眠后继续
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            continue;
+        }
+        
+        // 检查socket错误
+        if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) {
+            last_error_ = SocketError::CLOSED;
+            connected_ = false;
+            LOG_ERROR("send_all: socket error: %s (revents=0x%x)", strerror(errno), pfd.revents);
+            return last_error_;
+        }
+        
+        // 尝试发送数据
+        ssize_t sent = ::send(sockfd_, buffer + total_sent, len - total_sent, MSG_NOSIGNAL);
+        
+        if (sent < 0) {
+            // 处理特定错误
+            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
+                // 这些错误是可恢复的，我们继续尝试
+                retry_count++;
+                
+                if (retry_count > max_retries) {
+                    last_error_ = SocketError::TIMEOUT;
+                    LOG_ERROR("send_all: too many retries on EAGAIN/EWOULDBLOCK");
+                    return last_error_;
+                }
+                
+                // 短暂休眠后继续
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                continue;
+            } else if (errno == EPIPE || errno == ECONNRESET) {
+                // 连接被对端关闭
+                last_error_ = SocketError::CLOSED;
+                connected_ = false;
+                LOG_ERROR("send_all: connection closed by peer: %s (errno=%d)", strerror(errno), errno);
+                return last_error_;
+            } else {
+                // 其他错误视为严重错误
+                last_error_ = SocketError::SEND_FAILED;
+                LOG_ERROR("send_all: send failed: %s (errno=%d)", strerror(errno), errno);
+                return last_error_;
+            }
+        } else if (sent == 0) {
+            // 发送0字节通常意味着连接已关闭
+            last_error_ = SocketError::CLOSED;
+            connected_ = false;
+            LOG_ERROR("send_all: connection closed (sent 0 bytes)");
+            return last_error_;
+        }
+        
+        // 更新已发送字节数
         total_sent += sent;
+        
+        // 成功发送数据后重置重试计数
+        retry_count = 0;
     }
     
-    return SocketError::SUCCESS;
+    // 所有数据发送完成
+    last_error_ = SocketError::SUCCESS;
+    return last_error_;
 }
 
 SocketError TcpSocket::recv_all(void* buffer, size_t len) {
     if (sockfd_ < 0) {
-        return SocketError::INVALID_STATE;
+        last_error_ = SocketError::INVALID_STATE;
+        return last_error_;
     }
     
     if (!buffer || len == 0) {
-        return SocketError::SUCCESS;
+        last_error_ = SocketError::INVALID_ARGUMENT;
+        return last_error_;
     }
     
-    char* ptr = static_cast<char*>(buffer);
-    size_t remaining = len;
+    // 使用偏移量跟踪已接收的数据
     size_t total_received = 0;
-    int retry_count = 0;
-    const int max_retries = 5;  // 增加重试次数
+    uint8_t* buf_ptr = static_cast<uint8_t*>(buffer);
     
-    while (remaining > 0) {
-        // 每次接收前检查socket是否有效
-        if (sockfd_ < 0 || !check_connection_state_()) {
-            fprintf(stderr, "Socket recv_all failed: Socket not connected or invalid, total received: %zu/%zu bytes\n", 
-                    total_received, len);
-            return SocketError::CLOSED;
+    // 记录开始时间用于超时检测
+    auto start_time = std::chrono::steady_clock::now();
+    auto current_time = start_time;
+    
+    // 计算总超时时间 (原超时时间的1.5倍，考虑到重试)
+    auto total_timeout_ms = options_.recv_timeout.count() * 1.5;
+    
+    // 最大重试次数和延迟
+    const int max_retries = 3;
+    int retry_count = 0;
+    
+    while (total_received < len) {
+        // 计算当前已用时间
+        current_time = std::chrono::steady_clock::now();
+        auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            current_time - start_time).count();
+        
+        // 检查是否超时
+        if (elapsed_ms > total_timeout_ms) {
+            last_error_ = SocketError::TIMEOUT;
+            LOG_ERROR("recv_all timeout after %lld ms", elapsed_ms);
+            return last_error_;
         }
         
-        // 添加额外的连接检查 - 尝试轻量级的poll检测
-        struct pollfd check_pfd;
-        check_pfd.fd = sockfd_;
-        check_pfd.events = POLLIN;
-        check_pfd.revents = 0;
-        
-        // 快速检查连接状态（无超时）
-        int check_poll_ret = poll(&check_pfd, 1, 0);
-        if (check_poll_ret > 0) {
-            if (check_pfd.revents & POLLERR) {
-                int error = 0;
-                socklen_t error_len = sizeof(error);
-                getsockopt(sockfd_, SOL_SOCKET, SO_ERROR, &error, &error_len);
-                
-                fprintf(stderr, "Socket poll check detected error: %s (errno=%d)\n", 
-                        strerror(error), error);
-                
-                connected_ = false;
-                return SocketError::RECV_FAILED;
-            }
-            
-            if (check_pfd.revents & POLLHUP) {
-                fprintf(stderr, "Socket check detected POLLHUP, connection closed\n");
-                connected_ = false;
-                return SocketError::CLOSED;
-            }
-            
-            if (check_pfd.revents & POLLNVAL) {
-                fprintf(stderr, "Socket check detected POLLNVAL, invalid socket\n");
-                connected_ = false;
-                sockfd_ = -1;
-                return SocketError::INVALID_STATE;
-            }
+        // 检查socket是否有效
+        if (sockfd_ < 0 || !connected_) {
+            last_error_ = SocketError::INVALID_STATE;
+            LOG_ERROR("recv_all: socket not connected");
+            return last_error_;
         }
         
-        size_t received = 0;
-        SocketError err = recv(ptr, remaining, received);
+        // 检查socket是否可读
+        struct pollfd pfd;
+        pfd.fd = sockfd_;
+        pfd.events = POLLIN;
+        pfd.revents = 0;
         
-        if (err != SocketError::SUCCESS) {
-            // 如果接收到0字节，表示连接已关闭
-            if (err == SocketError::CLOSED) {
-                fprintf(stderr, "Socket recv_all failed: Connection closed by peer, total received: %zu/%zu bytes\n", 
-                        total_received, len);
-                connected_ = false;  // 标记为断开连接
-                return err;
-            }
-            
-            // 如果是超时错误，尝试重试几次
-            if (err == SocketError::TIMEOUT && retry_count < max_retries) {
-                retry_count++;
-                fprintf(stderr, "Socket recv timeout, retry %d/%d, total received: %zu/%zu bytes\n", 
-                        retry_count, max_retries, total_received, len);
-                std::this_thread::sleep_for(std::chrono::milliseconds(100));  // 添加短暂延迟
-                
-                // 在重试前再次检查连接状态
-                if (!check_connection_state_()) {
-                    fprintf(stderr, "Socket disconnected during timeout retry\n");
-                    return SocketError::CLOSED;
-                }
-                
+        // 计算剩余超时时间
+        int remaining_timeout_ms = static_cast<int>(total_timeout_ms - elapsed_ms);
+        if (remaining_timeout_ms < 0) remaining_timeout_ms = 0;
+        
+        int poll_result = poll(&pfd, 1, remaining_timeout_ms);
+        
+        if (poll_result < 0) {
+            // 系统调用被中断，这是可以恢复的，直接继续
+            if (errno == EINTR) {
                 continue;
             }
             
-            // 检查套接字是否仍然连接
-            if (!connected_) {
-                fprintf(stderr, "Socket recv_all failed: Socket disconnected, total received: %zu/%zu bytes\n", 
-                        total_received, len);
-                return SocketError::CLOSED;
+            // 其他不可恢复错误
+            last_error_ = SocketError::RECV_FAILED;
+            LOG_ERROR("recv_all: poll failed: %s (errno=%d)", strerror(errno), errno);
+            return last_error_;
+        } else if (poll_result == 0) {
+            // poll超时，但总时间可能还没到
+            retry_count++;
+            
+            if (retry_count > max_retries) {
+                last_error_ = SocketError::TIMEOUT;
+                LOG_ERROR("recv_all: poll timeout after %d retries", max_retries);
+                return last_error_;
             }
             
-            // 记录详细信息到errno
-            char err_buf[128] = {0};
-            strerror_r(errno, err_buf, sizeof(err_buf));
-            fprintf(stderr, "Socket recv_all failed: %s (errno=%d), total received: %zu/%zu bytes\n", 
-                    err_buf, errno, total_received, len);
-            
-            // 如果发生EBADF或其他关键错误，立即将连接标记为断开
-            if (errno == EBADF || errno == ENOTCONN || errno == ECONNRESET || errno == EPIPE) {
-                connected_ = false;
-                if (errno == EBADF) {
-                    sockfd_ = -1;
-                }
-                fprintf(stderr, "Socket recv_all detected critical error, marking as disconnected\n");
-                return SocketError::CLOSED;
-            }
-            
-            return err;
+            // 短暂休眠后继续
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            continue;
         }
         
-        // 如果接收到0字节，但没有错误，也认为连接已关闭
-        if (received == 0) {
-            fprintf(stderr, "Recv returned 0 bytes, connection closed by peer\n");
+        // 检查socket错误
+        if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) {
+            last_error_ = SocketError::CLOSED;
             connected_ = false;
-            return SocketError::CLOSED;
+            LOG_ERROR("recv_all: socket error: %s (revents=0x%x)", strerror(errno), pfd.revents);
+            return last_error_;
         }
         
-        // 重置重试计数
-        retry_count = 0;
+        // 尝试接收数据
+        ssize_t received = ::recv(sockfd_, buf_ptr + total_received, len - total_received, 0);
         
-        ptr += received;
-        remaining -= received;
+        if (received < 0) {
+            // 处理特定错误
+            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
+                // 这些错误是可恢复的，我们继续尝试
+                retry_count++;
+                
+                if (retry_count > max_retries) {
+                    last_error_ = SocketError::TIMEOUT;
+                    LOG_ERROR("recv_all: too many retries on EAGAIN/EWOULDBLOCK");
+                    return last_error_;
+                }
+                
+                // 短暂休眠后继续
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                continue;
+            } else if (errno == ECONNRESET) {
+                // 连接被对端重置
+                last_error_ = SocketError::CLOSED;
+                connected_ = false;
+                LOG_ERROR("recv_all: connection reset by peer: %s (errno=%d)", strerror(errno), errno);
+                return last_error_;
+            } else {
+                // 其他错误视为严重错误
+                last_error_ = SocketError::RECV_FAILED;
+                LOG_ERROR("recv_all: recv failed: %s (errno=%d)", strerror(errno), errno);
+                return last_error_;
+            }
+        } else if (received == 0) {
+            // 接收0字节表示对方已关闭连接
+            last_error_ = SocketError::CLOSED;
+            connected_ = false;
+            LOG_INFO("recv_all: connection closed by peer");
+            return last_error_;
+        }
+        
+        // 更新已接收字节数
         total_received += received;
+        
+        // 成功接收数据后重置重试计数
+        retry_count = 0;
     }
     
-    return SocketError::SUCCESS;
+    // 所有数据接收完成
+    last_error_ = SocketError::SUCCESS;
+    return last_error_;
 }
 
 void TcpSocket::close() {
@@ -879,7 +932,7 @@ uint16_t TcpSocket::get_remote_port() const {
 bool TcpSocket::check_connection_state_() {
     // 基本检查
     if (sockfd_ < 0 || !connected_) {
-        fprintf(stderr, "Basic connection check failed: sockfd_=%d, connected_=%d\n", sockfd_, connected_);
+        LOG_ERROR("Basic connection check failed: sockfd_=%d, connected_=%d", sockfd_, connected_);
         return false;
     }
     
@@ -901,7 +954,7 @@ bool TcpSocket::check_connection_state_() {
         
         // 其他错误表明socket可能有问题
         if (errno != EAGAIN && errno != EWOULDBLOCK) {
-            fprintf(stderr, "Poll failed in check_connection_state: %s (errno=%d)\n", 
+            LOG_ERROR("Poll failed in check_connection_state: %s (errno=%d)", 
                     strerror(errno), errno);
         }
         connected_ = false;
@@ -916,7 +969,7 @@ bool TcpSocket::check_connection_state_() {
             socklen_t len = sizeof(error);
             if (getsockopt(sockfd_, SOL_SOCKET, SO_ERROR, &error, &len) == 0) {
                 if (error != 0 && error != EAGAIN && error != EWOULDBLOCK) {
-                    fprintf(stderr, "Socket error detected in check_connection_state: %s (errno=%d)\n", 
+                    LOG_ERROR("Socket error detected in check_connection_state: %s (errno=%d)", 
                             strerror(error), error);
                 }
             }
@@ -934,7 +987,7 @@ bool TcpSocket::check_connection_state_() {
     
     // 如果poll返回>0但既不可读也不可写，可能有问题
     if (ret > 0) {
-        fprintf(stderr, "Socket not readable/writable but no error: revents=%d\n", pfd.revents);
+        LOG_ERROR("Socket not readable/writable but no error: revents=%d", pfd.revents);
         connected_ = false;
         return false;
     }
@@ -971,7 +1024,7 @@ bool TcpSocket::is_connected() const {
         
         // 其他错误表明socket可能有问题
         if (errno != EAGAIN && errno != EWOULDBLOCK) {
-            fprintf(stderr, "Poll failed in is_connected: %s (errno=%d)\n", 
+            LOG_ERROR("Poll failed in is_connected: %s (errno=%d)", 
                     strerror(errno), errno);
         }
         return false;
@@ -985,7 +1038,7 @@ bool TcpSocket::is_connected() const {
             socklen_t len = sizeof(error);
             if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &error, &len) == 0) {
                 if (error != 0 && error != EAGAIN && error != EWOULDBLOCK) {
-                    fprintf(stderr, "Socket error detected in is_connected: %s (errno=%d)\n", 
+                    LOG_ERROR("Socket error detected in is_connected: %s (errno=%d)", 
                             strerror(error), error);
                 }
             }
@@ -993,13 +1046,13 @@ bool TcpSocket::is_connected() const {
         
         // POLLHUP意味着连接已关闭
         if (pfd.revents & POLLHUP) {
-            fprintf(stderr, "POLLHUP detected in is_connected (fd=%d)\n", fd);
+            LOG_WARNING("POLLHUP detected in is_connected (fd=%d)", fd);
             return false;
         }
         
         // POLLNVAL意味着socket描述符无效
         if (pfd.revents & POLLNVAL) {
-            fprintf(stderr, "POLLNVAL detected in is_connected (fd=%d)\n", fd);
+            LOG_WARNING("POLLNVAL detected in is_connected (fd=%d)", fd);
             return false;
         }
         
@@ -1014,7 +1067,7 @@ bool TcpSocket::is_connected() const {
     
     // 如果poll返回>0但既不可读也不可写，可能有问题
     if (ret > 0) {
-        fprintf(stderr, "Socket not readable/writable but no error: revents=%d\n", pfd.revents);
+        LOG_ERROR("Socket not readable/writable but no error: revents=%d", pfd.revents);
         return false;
     }
     
@@ -1056,16 +1109,15 @@ void TcpSocket::set_recv_timeout(const std::chrono::milliseconds& timeout) {
 }
 
 void TcpSocket::set_send_timeout(const std::chrono::milliseconds& timeout) {
-    if (sockfd_ < 0) {
-        return;
-    }
+    options_.send_timeout = timeout;
     
     struct timeval tv;
-    tv.tv_sec = timeout.count() / 1000;
-    tv.tv_usec = (timeout.count() % 1000) * 1000;
+    tv.tv_sec = static_cast<time_t>(timeout.count() / 1000);
+    tv.tv_usec = static_cast<suseconds_t>((timeout.count() % 1000) * 1000);
     
-    setsockopt(sockfd_, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-    options_.send_timeout = timeout;
+    if (sockfd_ >= 0) {
+        setsockopt(sockfd_, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    }
 }
 
 void TcpSocket::apply_socket_options() {
@@ -1102,10 +1154,14 @@ void TcpSocket::apply_socket_options() {
 }
 
 void TcpSocket::get_socket_address(const struct sockaddr_in& addr, std::string& ip, uint16_t& port) {
-    char ip_str[INET_ADDRSTRLEN];
+    char ip_str[INET_ADDRSTRLEN] = {0};
     inet_ntop(AF_INET, &addr.sin_addr, ip_str, sizeof(ip_str));
     ip = ip_str;
     port = ntohs(addr.sin_port);
+}
+
+SocketError TcpSocket::get_last_error() const {
+    return last_error_;
 }
 
 } // namespace network

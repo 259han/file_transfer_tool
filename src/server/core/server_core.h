@@ -105,6 +105,13 @@ private:
     bool handle_key_exchange(const std::vector<uint8_t>& buffer);
     
     /**
+     * @brief 处理心跳请求并发送响应
+     * @param buffer 消息缓冲区
+     * @return 是否处理成功
+     */
+    bool handle_heartbeat_response(const std::vector<uint8_t>& buffer);
+    
+    /**
      * @brief 加密数据
      * @param data 待加密数据
      * @return 加密后的数据
@@ -191,10 +198,7 @@ public:
      * @brief 获取当前会话数
      * @return 当前会话数
      */
-    size_t get_session_count() const {
-        std::lock_guard<std::mutex> lock(sessions_mutex_);
-        return sessions_.size();
-    }
+    size_t get_session_count() const;
     
     /**
      * @brief 获取存储路径
@@ -222,8 +226,6 @@ private:
     std::thread session_manager_thread_;
     std::atomic<bool> running_;
     
-    std::vector<std::shared_ptr<ClientSession>> sessions_;
-    mutable std::mutex sessions_mutex_;
     std::condition_variable stop_cv_;
     std::mutex stop_mutex_;
     

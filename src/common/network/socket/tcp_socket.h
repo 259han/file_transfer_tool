@@ -33,24 +33,32 @@ enum class SocketError {
  * @brief Socket选项
  */
 struct SocketOptions {
-    bool reuse_address;                        // 重用地址
-    bool keep_alive;                           // 保活
-    bool non_blocking;                         // 非阻塞
-    int send_buffer_size;                      // 发送缓冲区大小
-    int recv_buffer_size;                      // 接收缓冲区大小
-    std::chrono::milliseconds connect_timeout; // 连接超时
-    std::chrono::milliseconds send_timeout;    // 发送超时
-    std::chrono::milliseconds recv_timeout;    // 接收超时
+    std::chrono::milliseconds connect_timeout;  // 连接超时时间
+    std::chrono::milliseconds recv_timeout;     // 接收超时时间
+    std::chrono::milliseconds send_timeout;     // 发送超时时间
+    bool keep_alive;                            // 是否启用TCP保活
+    int keep_idle;                              // 保活空闲时间(秒)
+    int keep_interval;                          // 保活探测间隔(秒)
+    int keep_count;                             // 保活探测次数
+    int recv_buffer_size;                       // 接收缓冲区大小
+    int send_buffer_size;                       // 发送缓冲区大小
+    bool reuse_address;                         // 是否复用地址
+    bool reuse_port;                            // 是否复用端口
+    bool non_blocking;                          // 是否使用非阻塞模式
     
     SocketOptions()
-        : reuse_address(true),
+        : connect_timeout(std::chrono::seconds(10)),
+          recv_timeout(std::chrono::seconds(30)),
+          send_timeout(std::chrono::seconds(30)),
           keep_alive(true),
-          non_blocking(false),
-          send_buffer_size(64 * 1024),
-          recv_buffer_size(64 * 1024),
-          connect_timeout(10000),
-          send_timeout(10000),
-          recv_timeout(30000) {
+          keep_idle(60),            // 60秒后开始探测
+          keep_interval(5),         // 每5秒探测一次
+          keep_count(3),            // 探测3次无响应则认为连接断开
+          recv_buffer_size(256 * 1024),  // 256KB
+          send_buffer_size(256 * 1024),  // 256KB
+          reuse_address(true),
+          reuse_port(false),
+          non_blocking(false) {
     }
 };
 
@@ -226,6 +234,12 @@ public:
      */
     void set_send_timeout(const std::chrono::milliseconds& timeout);
     
+    /**
+     * @brief 获取最后一次操作的错误代码
+     * @return 错误代码
+     */
+    SocketError get_last_error() const;
+    
 private:
     /**
      * @brief 应用socket选项
@@ -254,6 +268,7 @@ private:
     uint16_t local_port_;
     std::string remote_ip_;
     uint16_t remote_port_;
+    SocketError last_error_;
 };
 
 } // namespace network

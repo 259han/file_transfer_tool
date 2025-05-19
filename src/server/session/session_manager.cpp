@@ -81,16 +81,24 @@ size_t SessionManager::get_session_count() const {
 void SessionManager::clean_expired_sessions() {
     std::lock_guard<std::mutex> lock(mutex_);
     
+    size_t removed = 0;
+    
     for (auto it = sessions_.begin(); it != sessions_.end();) {
-        if (!it->second->is_connected()) {
-            LOG_INFO("Removing expired session: %zu", it->first);
+        auto session = it->second;
+        
+        // 检查会话是否已断开连接
+        if (!session->is_connected()) {
+            LOG_INFO("Removing expired session: %zu", session->get_session_id());
             it = sessions_.erase(it);
+            removed++;
         } else {
             ++it;
         }
     }
     
-    LOG_DEBUG("Cleaned expired sessions, total: %zu", sessions_.size());
+    if (removed > 0 || !sessions_.empty()) {
+        LOG_DEBUG("Cleaned expired sessions, total: %zu", sessions_.size());
+    }
 }
 
 void SessionManager::close_all_sessions() {
@@ -98,11 +106,18 @@ void SessionManager::close_all_sessions() {
     
     LOG_INFO("Closing all sessions: %zu", sessions_.size());
     
-    for (auto& pair : sessions_) {
+    // 创建一个临时副本，避免在循环中修改容器
+    auto sessions_copy = sessions_;
+    
+    // 先停止所有会话
+    for (auto& pair : sessions_copy) {
         pair.second->stop();
     }
     
+    // 清空会话容器
     sessions_.clear();
+    
+    LOG_INFO("All sessions closed");
 }
 
 void SessionManager::set_max_sessions(size_t max_sessions) {
