@@ -8,35 +8,6 @@
 </div>
 
 <div id="zh-cn">
-## 错误处理
-
-记得使用log
-
-不可恢复错误（Fatal Errors）
-定义：系统运行时无法处理的严重错误，例如系统故障、程序员编写的严重错误（如越界访问、野指针等）。
-处理方式：
-快速失败（Fail Fast）：直接终止程序运行，避免程序在未知状态下继续执行。
-记录错误信息：将错误信息（如堆栈信息、错误描述等）输出到日志或控制台，便于后续排查问题。
-避免掩盖错误：不要试图忽略这些错误，因为它们可能导致程序在其他位置崩溃，增加问题排查的难度。
-可恢复错误（Recoverable Errors）
-定义：在运行时可以被程序捕获并处理的错误，例如文件打开失败、网络连接超时、数据格式错误等。
-处理方式：
-尝试恢复：根据错误类型采取相应的恢复措施，例如重试操作、跳过当前任务、等待条件满足等。
-继续执行：在处理完错误后，程序应继续执行后续任务，而不是直接退出。
-特殊情况：内存不足（OOM）
-定义：内存分配失败（如std::bad_alloc）。
-处理方式：
-区分场景：
-不可恢复：如果内存不足导致关键业务逻辑无法继续（如核心对象无法分配），则视为不可恢复错误，直接终止程序。
-可恢复：如果可以通过调整内存分配策略（如减少分配量、释放其他资源）来解决，则视为可恢复错误。
-异常处理的使用
-不可恢复错误：C++的异常处理机制（如try-catch）更适合用于处理不可恢复错误，因为这些错误通常需要快速终止程序。
-可恢复错误：对于可恢复错误，可以考虑使用返回错误码等机制，而不是依赖异常处理，以避免对程序性能造成不必要的冲击。
-避免滥用异常：并非所有错误都需要通过异常处理来解决，异常处理应主要用于处理那些无法通过正常逻辑处理的异常情况。
-错误处理的哲学
-明确错误类型：区分错误是不可恢复还是可恢复，避免将不可恢复错误当作可恢复错误处理，反之亦然。
-优雅性与性能平衡：在选择错误处理机制时，应权衡代码的优雅性和程序的性能，避免过度依赖异常处理而影响关键计算任务的性能。
-
 
 ## 项目简介
 
@@ -158,6 +129,13 @@ make -j$(nproc)
 - 通过消息标志位识别加密状态，自动处理加密和解密
 
 ### 最近更新
+
+- **2025-05-19**: 修复了下载功能中的消息解析问题
+  - 解决了加密下载时，客户端错误地将响应消息解析为请求消息的问题
+  - 增强了消息类型识别逻辑，提高了消息解析的鲁棒性
+  - 改进了DownloadMessage::deserialize方法，更可靠地区分请求和响应消息
+  - 为消息解析添加了更严格的数据验证，包括文件名验证和合理的偏移量检查
+  - 优化了客户端对解密后消息的处理流程，确保数据正确写入文件
 
 - **2023-11-15**: 修复了字节序问题，确保在不同平台之间正确传输文件大小信息
   - 解决了大文件传输中的数据大小不匹配问题
@@ -305,45 +283,16 @@ The project follows a modular design with clear responsibilities for each module
 
 ### Recent Updates
 
-- **2023-11-15**: Fixed endianness issues to ensure correct file size information transfer between different platforms
-  - Resolved data size mismatch problems in large file transfers
+- **2025-05-19**: Fixed message parsing issues in the download functionality
+  - Resolved a problem where the client incorrectly parsed response messages as request messages during encrypted downloads
+  - Enhanced message type identification logic to improve parsing robustness
+  - Improved the DownloadMessage::deserialize method to more reliably distinguish between request and response messages
+  - Added stricter data validation for message parsing, including filename validation and reasonable offset checks
+  - Optimized client handling of decrypted messages to ensure data is correctly written to files
+
+- **2023-11-15**: Fixed byte order issues to ensure correct transmission of file size information across different platforms
+  - Resolved data size mismatch issues in large file transfers
   - Implemented network byte order conversion for 64-bit integers in upload and download messages
-  - Optimized data processing workflow in encrypted transmissions
+  - Optimized data processing flow in encrypted transmissions
 
-For detailed development documentation, please refer to the `docs/` directory and the `development_guide.md` file.
-
-## Contributing
-
-Contributions, bug reports, and feature requests are welcome. Please follow these steps:
-
-1. Fork the project
-2. Create a feature branch (`git checkout -b feature/amazing-feature`)
-3. Commit your changes (`git commit -m 'Add some amazing feature'`)
-4. Push to the branch (`git push origin feature/amazing-feature`)
-5. Open a Pull Request
-
-## License
-
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
-
-</div>
-
-<script>
-function switchLanguage(lang) {
-  // 隐藏所有语言内容
-  document.getElementById('zh-cn').style.display = 'none';
-  document.getElementById('en').style.display = 'none';
-  
-  // 显示选中的语言
-  document.getElementById(lang).style.display = 'block';
-  
-  // 更新按钮样式
-  document.getElementById('zh-cn-btn').style.fontWeight = lang === 'zh-cn' ? 'bold' : 'normal';
-  document.getElementById('en-btn').style.fontWeight = lang === 'en' ? 'bold' : 'normal';
-}
-
-// 初始化显示中文
-document.addEventListener('DOMContentLoaded', function() {
-  switchLanguage('zh-cn');
-});
-</script> 
+For detailed development documentation, please refer to the `
