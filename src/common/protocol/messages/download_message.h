@@ -4,6 +4,16 @@
 #include <string>
 #include <vector>
 
+// 前置声明
+namespace ft {
+namespace client {
+    class ClientCore;
+}
+namespace server {
+    class ClientSession;
+}
+}
+
 namespace ft {
 namespace protocol {
 
@@ -110,6 +120,18 @@ public:
      * @param encrypted 是否加密
      */
     void set_encrypted(bool encrypted);
+    
+    /**
+     * @brief 修改偏移量
+     * @param offset 新的偏移量
+     */
+    void set_offset(uint64_t offset);
+    
+    /**
+     * @brief 设置友元类以允许直接访问offset_
+     */
+    friend class ft::client::ClientCore;
+    friend class ft::server::ClientSession;
 
 private:
     /**

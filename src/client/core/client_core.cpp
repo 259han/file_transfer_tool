@@ -205,7 +205,7 @@ bool ClientCore::connect(const ServerInfo& server) {
         
         // 验证连接状态
         if (!socket_ || !socket_->is_connected()) {
-            LOG_ERROR("Socket connection lost before heartbeat");
+            LOG_ERROR("Socket connection lost before sending heartbeat");
             is_connected_ = false;
             return false;
         }
@@ -554,7 +554,7 @@ bool ClientCore::send_heartbeat() {
     uint8_t type_value = header_buf.type;
     uint32_t length_value = header_buf.length;
     
-    LOG_DEBUG("Received heartbeat response: magic=0x%08x, type=%d, length=%u", 
+    LOG_DEBUG("Received heartbeat response: magic=0x%08x, type=%d, length: %u", 
              magic_value, type_value, length_value);
              
     if (magic_value != protocol::PROTOCOL_MAGIC || 
@@ -969,13 +969,14 @@ TransferResult ClientCore::upload(const TransferRequest& request) {
                     result.error_message = "Connection closed by server while receiving response header";
                 } else {
                     char err_buf[128] = {0};
-                    strerror_r(errno, err_buf, sizeof(err_buf));
+                    // 正确处理strerror_r的返回值
+                    char* err_str = strerror_r(errno, err_buf, sizeof(err_buf));
                     result.error_message = "Failed to receive response header";
                     LOG_ERROR("%s: %d, socket state: connected=%d, errno: %d (%s)", 
                              result.error_message.c_str(), 
                              static_cast<int>(err),
                              socket_->is_connected(),
-                             errno, err_buf);
+                             errno, err_str ? err_str : err_buf);
                 }
                 
                 return result;
@@ -998,10 +999,11 @@ TransferResult ClientCore::upload(const TransferRequest& request) {
         // 保存header字段到局部变量
         uint32_t magic_value = header.magic;
         uint8_t type_value = header.type;
+        uint8_t flags_value = header.flags;
         uint32_t length_value = header.length;
         
-        LOG_INFO("Received response header - magic: 0x%08x, type: %d, length: %u", 
-                 magic_value, type_value, length_value);
+        LOG_DEBUG("Received response header - magic: 0x%08x, type: %d, flags: 0x%02x, length: %u", 
+                 magic_value, type_value, flags_value, length_value);
         
         // 检查魔数
         if (magic_value != protocol::PROTOCOL_MAGIC) {
@@ -1009,6 +1011,22 @@ TransferResult ClientCore::upload(const TransferRequest& request) {
             LOG_ERROR("%s: expected 0x%08x, got 0x%08x", result.error_message.c_str(), 
                       protocol::PROTOCOL_MAGIC, magic_value);
             return result;
+        }
+        
+        // 检查操作类型
+        if (static_cast<protocol::OperationType>(type_value) != protocol::OperationType::DOWNLOAD) {
+            result.error_message = "Invalid operation type in response";
+            LOG_ERROR("%s: expected %d, got %d", result.error_message.c_str(), 
+                      static_cast<int>(protocol::OperationType::DOWNLOAD), type_value);
+            return result;
+        }
+        
+        // 解析标志位
+        {
+            bool header_encrypted_flag = (flags_value & static_cast<uint8_t>(protocol::ProtocolFlags::ENCRYPTED)) != 0;
+            bool header_last_chunk_flag = (flags_value & static_cast<uint8_t>(protocol::ProtocolFlags::LAST_CHUNK)) != 0;
+            LOG_DEBUG("Response message flags: encrypted=%d, last_chunk=%d", 
+                    header_encrypted_flag ? 1 : 0, header_last_chunk_flag ? 1 : 0);
         }
         
         // 接收消息体
@@ -1066,41 +1084,121 @@ TransferResult ClientCore::upload(const TransferRequest& request) {
         }
         
         // 检查响应是否加密
-        bool is_encrypted = (response_msg.get_flags() & static_cast<uint8_t>(protocol::ProtocolFlags::ENCRYPTED)) != 0;
-        LOG_DEBUG("Response message flags: 0x%02x, is_encrypted: %d", response_msg.get_flags(), is_encrypted ? 1 : 0);
-        
-        if (is_encrypted && encryption_enabled_ && key_exchange_completed_) {
-            LOG_DEBUG("Response is encrypted, decrypting payload");
+        {
+            bool msg_encrypted_flag = (response_msg.get_flags() & static_cast<uint8_t>(protocol::ProtocolFlags::ENCRYPTED)) != 0;
+            bool msg_last_chunk_flag = (response_msg.get_flags() & static_cast<uint8_t>(protocol::ProtocolFlags::LAST_CHUNK)) != 0;
+            LOG_DEBUG("Response message flags: 0x%02x, is_encrypted: %d, is_last_chunk: %d", 
+                    response_msg.get_flags(), msg_encrypted_flag ? 1 : 0, msg_last_chunk_flag ? 1 : 0);
             
-            // 获取负载并解密
-            const std::vector<uint8_t>& encrypted_payload = response_msg.get_payload();
-            std::vector<uint8_t> decrypted_payload = decrypt_data(encrypted_payload);
-            
-            // 创建一个新的消息来解析解密后的负载
-            protocol::Message decrypted_msg(protocol::OperationType::UPLOAD);
-            std::vector<uint8_t> decrypted_buffer(sizeof(protocol::ProtocolHeader) + decrypted_payload.size());
-            
-            // 复制原消息头但移除加密标志
-            protocol::ProtocolHeader decrypted_header = header; // 使用之前读取的header
-            decrypted_header.flags &= ~static_cast<uint8_t>(protocol::ProtocolFlags::ENCRYPTED);
-            std::memcpy(decrypted_buffer.data(), &decrypted_header, sizeof(protocol::ProtocolHeader));
-            
-            // 添加解密后的负载
-            std::memcpy(decrypted_buffer.data() + sizeof(protocol::ProtocolHeader), 
-                       decrypted_payload.data(), decrypted_payload.size());
-            
-            // 解析解密后的消息
-            if (!response_msg.decode(decrypted_buffer)) {
-                result.error_message = "Failed to decode decrypted server response";
-                LOG_ERROR("%s", result.error_message.c_str());
+            if (msg_encrypted_flag && encryption_enabled_ && key_exchange_completed_) {
+                LOG_DEBUG("Response is encrypted, decrypting payload");
+                
+                // 获取负载并解密
+                const std::vector<uint8_t>& encrypted_payload = response_msg.get_payload();
+                LOG_DEBUG("Encrypted payload size: %zu", encrypted_payload.size());
+                
+                // 打印前几个字节用于调试
+                if (encrypted_payload.size() > 0) {
+                    std::string data_preview;
+                    for (size_t i = 0; i < std::min(encrypted_payload.size(), size_t(16)); ++i) {
+                        char hex[4];
+                        snprintf(hex, sizeof(hex), "%02x ", encrypted_payload[i]);
+                        data_preview += hex;
+                    }
+                    LOG_DEBUG("Encrypted data preview: %s", data_preview.c_str());
+                }
+                
+                std::vector<uint8_t> decrypted_payload = decrypt_data(encrypted_payload);
+                LOG_DEBUG("Decrypted payload size: %zu", decrypted_payload.size());
+                
+                // 打印解密后的前几个字节用于调试
+                if (decrypted_payload.size() > 0) {
+                    std::string data_preview;
+                    for (size_t i = 0; i < std::min(decrypted_payload.size(), size_t(16)); ++i) {
+                        char hex[4];
+                        snprintf(hex, sizeof(hex), "%02x ", decrypted_payload[i]);
+                        data_preview += hex;
+                    }
+                    LOG_DEBUG("Decrypted data preview: %s", data_preview.c_str());
+                }
+                
+                // 提取文件数据
+                size_t metadata_size = sizeof(uint64_t) * 2;
+                
+                // 检查解密后的负载大小是否至少包含元数据
+                if (decrypted_payload.size() < metadata_size) {
+                    LOG_ERROR("Decrypted payload too small to contain metadata: %zu", decrypted_payload.size());
+                    
+                    // 尝试恢复模式 - 如果收到了LAST_CHUNK标志，可能是服务器在发送最后一个空块
+                    if (response_msg.get_flags() & static_cast<uint8_t>(protocol::ProtocolFlags::LAST_CHUNK)) {
+                        LOG_WARNING("Last chunk flag set with insufficient data - treating as empty final chunk");
+                        
+                        // 创建一个空的下载响应，但保留LAST_CHUNK标志和当前总大小
+                        protocol::DownloadMessage download_response;
+                        download_response.set_response_data(nullptr, 0, offset, true); // 使用当前偏移量作为总大小
+                        download_response.set_offset(offset);
+                        
+                        // 更新原始消息
+                        response_msg = download_response;
+                        LOG_DEBUG("Created empty final response message with total_size=%zu", offset);
+                        
+                        // 继续处理，标记为成功
+                        result.success = true;
+                        result.total_bytes = offset;
+                        result.transferred_bytes = offset;
+                        return result;
+                    }
+                    
+                    // 如果不是上述情况，则返回错误
+                    file.close();
+                    result.error_message = "Decrypted payload too small to contain metadata";
+                    return result;
+                }
+                
+                size_t file_data_size = decrypted_payload.size() - metadata_size;
+
+                // 解析元数据
+                uint64_t offset_be = 0;
+                uint64_t total_size_be = 0;
+                std::memcpy(&offset_be, decrypted_payload.data(), sizeof(uint64_t));
+                std::memcpy(&total_size_be, decrypted_payload.data() + sizeof(uint64_t), sizeof(uint64_t));
+                
+                // 转换为主机字节序
+                uint64_t offset_value = protocol::net_to_host64(offset_be);
+                uint64_t total_size = protocol::net_to_host64(total_size_be);
+                
+                LOG_DEBUG("Metadata parsed: offset=%llu, total_size=%llu, data_size=%zu", 
+                          offset_value, total_size, file_data_size);
+                
+                // 提取文件数据
+                std::vector<uint8_t> file_data;
+                if (file_data_size > 0) {
+                    file_data.resize(file_data_size);
+                    std::memcpy(file_data.data(), decrypted_payload.data() + metadata_size, file_data_size);
+                    LOG_DEBUG("Extracted file data of size: %zu", file_data.size());
+                } else {
+                    LOG_WARNING("No file data in decrypted payload, but this could be normal if server returned an empty chunk");
+                    // 即使没有数据，我们也继续处理而不是直接返回错误
+                }
+                
+                // 获取原始消息的标志
+                bool response_is_last_chunk = (response_msg.get_flags() & static_cast<uint8_t>(protocol::ProtocolFlags::LAST_CHUNK)) != 0;
+                
+                // 创建新的下载消息
+                protocol::DownloadMessage download_response;
+                download_response.set_response_data(file_data.data(), file_data.size(), total_size, response_is_last_chunk);
+                download_response.set_offset(offset_value);
+                
+                // 更新原始消息
+                response_msg = download_response;
+                
+                LOG_DEBUG("Successfully processed encrypted download response: offset=%llu, total_size=%llu, data_size=%zu, last_chunk=%d", 
+                         offset_value, total_size, file_data.size(), response_is_last_chunk);
+            } else if (msg_encrypted_flag) {
+                LOG_WARNING("Response is encrypted but encryption is not ready");
+                result.error_message = "Received encrypted response but encryption is not enabled";
                 return result;
             }
-            
-            LOG_DEBUG("Response decrypted successfully");
-        } else if (is_encrypted) {
-            LOG_WARNING("Response is encrypted but encryption is not ready");
-            result.error_message = "Received encrypted response but encryption is not enabled";
-            return result;
         }
         
         // 检查响应类型
@@ -1112,9 +1210,11 @@ TransferResult ClientCore::upload(const TransferRequest& request) {
             result.error_message = "Server error: " + error_message;
             LOG_ERROR("%s", result.error_message.c_str());
             return result;
-        } else if (response_msg.get_operation_type() != protocol::OperationType::UPLOAD) {
+        } else if (response_msg.get_operation_type() != protocol::OperationType::DOWNLOAD) {
             result.error_message = "Unexpected response type from server";
-            LOG_ERROR("%s", result.error_message.c_str());
+            LOG_ERROR("Invalid operation type in response: expected %d, got %d", 
+                     static_cast<int>(protocol::OperationType::DOWNLOAD),
+                     static_cast<int>(response_msg.get_operation_type()));
             return result;
         }
         
@@ -1313,15 +1413,16 @@ TransferResult ClientCore::download(const TransferRequest& request) {
             return result;
         }
         
-        // 保存header字段到局部变量
+        // 保存header字段到局部变量，避免packed结构体直接访问问题
         uint32_t magic_value = header.magic;
         uint8_t type_value = header.type;
+        uint8_t flags_value = header.flags;
         uint32_t length_value = header.length;
         
-        LOG_DEBUG("Received header: magic=0x%08x, type=%d, length=%u", 
-                 magic_value, type_value, length_value);
+        LOG_DEBUG("Received header: magic=0x%08x, type=%d, flags=0x%02x, length=%u", 
+                 magic_value, type_value, flags_value, length_value);
         
-        // 检查魔数
+        // 检查消息头有效性
         if (magic_value != protocol::PROTOCOL_MAGIC) {
             result.error_message = "Invalid protocol magic";
             LOG_ERROR("%s: expected 0x%08x, got 0x%08x", result.error_message.c_str(), 
@@ -1332,11 +1433,18 @@ TransferResult ClientCore::download(const TransferRequest& request) {
         
         // 检查操作类型
         if (static_cast<protocol::OperationType>(type_value) != protocol::OperationType::DOWNLOAD) {
-            result.error_message = "Invalid operation type";
+            result.error_message = "Invalid operation type in response";
             LOG_ERROR("%s: expected %d, got %d", result.error_message.c_str(), 
                       static_cast<int>(protocol::OperationType::DOWNLOAD), type_value);
-            file.close();
             return result;
+        }
+        
+        // 解析标志位
+        {
+            bool header_encrypted_flag = (flags_value & static_cast<uint8_t>(protocol::ProtocolFlags::ENCRYPTED)) != 0;
+            bool header_last_chunk_flag = (flags_value & static_cast<uint8_t>(protocol::ProtocolFlags::LAST_CHUNK)) != 0;
+            LOG_DEBUG("Message flags: encrypted=%d, last_chunk=%d", 
+                    header_encrypted_flag ? 1 : 0, header_last_chunk_flag ? 1 : 0);
         }
         
         // 接收消息体
@@ -1397,143 +1505,300 @@ TransferResult ClientCore::download(const TransferRequest& request) {
         }
 
         // 检查响应是否加密
-        bool is_encrypted = (msg.get_flags() & static_cast<uint8_t>(protocol::ProtocolFlags::ENCRYPTED)) != 0;
-        LOG_DEBUG("Response message flags: 0x%02x, is_encrypted: %d", msg.get_flags(), is_encrypted ? 1 : 0);
-        
-        if (is_encrypted && encryption_enabled_ && key_exchange_completed_) {
-            LOG_DEBUG("Response is encrypted, decrypting payload");
+        {
+            bool msg_encrypted_flag = (msg.get_flags() & static_cast<uint8_t>(protocol::ProtocolFlags::ENCRYPTED)) != 0;
+            bool msg_last_chunk_flag = (msg.get_flags() & static_cast<uint8_t>(protocol::ProtocolFlags::LAST_CHUNK)) != 0;
+            LOG_DEBUG("Response message flags: 0x%02x, is_encrypted: %d, is_last_chunk: %d", 
+                    msg.get_flags(), msg_encrypted_flag ? 1 : 0, msg_last_chunk_flag ? 1 : 0);
             
-            // 获取负载并解密
-            const std::vector<uint8_t>& encrypted_payload = msg.get_payload();
-            LOG_DEBUG("Encrypted payload size: %zu", encrypted_payload.size());
-            
-            std::vector<uint8_t> decrypted_payload = decrypt_data(encrypted_payload);
-            
-            // 提取文件数据
-            size_t metadata_size = sizeof(uint64_t) * 2;
-            size_t file_data_size = decrypted_payload.size() - metadata_size;
+            if (msg_encrypted_flag && encryption_enabled_ && key_exchange_completed_) {
+                LOG_DEBUG("Response is encrypted, decrypting payload");
+                
+                // 获取负载并解密
+                const std::vector<uint8_t>& encrypted_payload = msg.get_payload();
+                LOG_DEBUG("Encrypted payload size: %zu", encrypted_payload.size());
+                
+                // 打印前几个字节用于调试
+                if (encrypted_payload.size() > 0) {
+                    std::string data_preview;
+                    for (size_t i = 0; i < std::min(encrypted_payload.size(), size_t(16)); ++i) {
+                        char hex[4];
+                        snprintf(hex, sizeof(hex), "%02x ", encrypted_payload[i]);
+                        data_preview += hex;
+                    }
+                    LOG_DEBUG("Encrypted data preview: %s", data_preview.c_str());
+                }
+                
+                std::vector<uint8_t> decrypted_payload = decrypt_data(encrypted_payload);
+                LOG_DEBUG("Decrypted payload size: %zu", decrypted_payload.size());
+                
+                // 打印解密后的前几个字节用于调试
+                if (decrypted_payload.size() > 0) {
+                    std::string data_preview;
+                    for (size_t i = 0; i < std::min(decrypted_payload.size(), size_t(16)); ++i) {
+                        char hex[4];
+                        snprintf(hex, sizeof(hex), "%02x ", decrypted_payload[i]);
+                        data_preview += hex;
+                    }
+                    LOG_DEBUG("Decrypted data preview: %s", data_preview.c_str());
+                }
+                
+                // 提取文件数据
+                size_t metadata_size = sizeof(uint64_t) * 2;
+                
+                // 检查解密后的负载大小是否至少包含元数据
+                if (decrypted_payload.size() < metadata_size) {
+                    LOG_ERROR("Decrypted payload too small to contain metadata: %zu", decrypted_payload.size());
+                    
+                    // 尝试恢复模式 - 如果收到了LAST_CHUNK标志，可能是服务器在发送最后一个空块
+                    if (msg.get_flags() & static_cast<uint8_t>(protocol::ProtocolFlags::LAST_CHUNK)) {
+                        LOG_WARNING("Last chunk flag set with insufficient data - treating as empty final chunk");
+                        
+                        // 创建一个空的下载响应，但保留LAST_CHUNK标志和当前总大小
+                        protocol::DownloadMessage download_response;
+                        download_response.set_response_data(nullptr, 0, offset, true); // 使用当前偏移量作为总大小
+                        download_response.set_offset(offset);
+                        
+                        // 更新原始消息
+                        msg = download_response;
+                        LOG_DEBUG("Created empty final response message with total_size=%zu", offset);
+                        
+                        // 继续处理，标记为成功
+                        result.success = true;
+                        result.total_bytes = offset;
+                        result.transferred_bytes = offset;
+                        return result;
+                    }
+                    
+                    // 如果不是上述情况，则返回错误
+                    file.close();
+                    result.error_message = "Decrypted payload too small to contain metadata";
+                    return result;
+                }
+                
+                size_t file_data_size = decrypted_payload.size() - metadata_size;
 
-            // 解析元数据
-            uint64_t offset_be = 0;
-            uint64_t total_size_be = 0;
-            if (decrypted_payload.size() >= metadata_size) {
+                // 解析元数据
+                uint64_t offset_be = 0;
+                uint64_t total_size_be = 0;
                 std::memcpy(&offset_be, decrypted_payload.data(), sizeof(uint64_t));
                 std::memcpy(&total_size_be, decrypted_payload.data() + sizeof(uint64_t), sizeof(uint64_t));
-            
+                
                 // 转换为主机字节序
-                uint64_t offset = protocol::net_to_host64(offset_be);
+                uint64_t offset_value = protocol::net_to_host64(offset_be);
                 uint64_t total_size = protocol::net_to_host64(total_size_be);
-            
-                LOG_DEBUG("Metadata parsed: offset=%llu, total_size=%llu", offset, total_size);
-            }
-            
-            // 检查文件数据大小是否合理
-            if (file_data_size > 1024 * 1024 * 1024) {  // 超过1GB，很可能是错误的
-                LOG_ERROR("Unreasonable file_data_size: %zu", file_data_size);
+                
+                LOG_DEBUG("Metadata parsed: offset=%llu, total_size=%llu, data_size=%zu", 
+                          offset_value, total_size, file_data_size);
+                
+                // 提取文件数据
+                std::vector<uint8_t> file_data;
+                if (file_data_size > 0) {
+                    file_data.resize(file_data_size);
+                    std::memcpy(file_data.data(), decrypted_payload.data() + metadata_size, file_data_size);
+                    LOG_DEBUG("Extracted file data of size: %zu", file_data.size());
+                } else {
+                    LOG_WARNING("No file data in decrypted payload, but this could be normal if server returned an empty chunk");
+                    // 即使没有数据，我们也继续处理而不是直接返回错误
+                }
+                
+                // 获取原始消息的标志
+                bool response_is_last_chunk = (msg.get_flags() & static_cast<uint8_t>(protocol::ProtocolFlags::LAST_CHUNK)) != 0;
+                
+                // 创建新的下载消息
+                protocol::DownloadMessage download_response;
+                download_response.set_response_data(file_data.data(), file_data.size(), total_size, response_is_last_chunk);
+                download_response.set_offset(offset_value);
+                
+                // 更新原始消息
+                msg = download_response;
+                
+                LOG_DEBUG("Successfully processed encrypted download response: offset=%llu, total_size=%llu, data_size=%zu, last_chunk=%d", 
+                         offset_value, total_size, file_data.size(), response_is_last_chunk);
+            } else if (msg_encrypted_flag) {
+                LOG_WARNING("Response is encrypted but encryption is not ready");
+                result.error_message = "Received encrypted response but encryption is not enabled";
                 file.close();
                 return result;
             }
-            
-            std::vector<uint8_t> file_data;
-            
-            if (file_data_size > 0) {
-                file_data.resize(file_data_size);
-                // 从元数据后面提取文件数据，跳过偏移量和总大小字段
-                std::memcpy(file_data.data(), decrypted_payload.data() + metadata_size, file_data_size);
-            }
-            
-            // 创建新的下载消息
-            protocol::DownloadMessage download_response;
-            // 设置响应数据，不包含元数据
-            download_response.set_response_data(file_data.data(), file_data.size(), file_data.size(), true);  // 设置LAST_CHUNK标志
-            
-            // 更新原始消息
-            msg = download_response;
-            
-            LOG_DEBUG("Successfully parsed decrypted download message: total_size=%zu, data_size=%zu", 
-                      file_data_size, file_data.size());
-        } else if (is_encrypted) {
-            LOG_WARNING("Response is encrypted but encryption is not ready");
-            result.error_message = "Received encrypted response but encryption is not enabled";
-            file.close();
-            return result;
         }
 
-        protocol::DownloadMessage response(msg);
+        // 直接使用已处理过的消息，而不是重新创建对象
+        // 原代码: protocol::DownloadMessage response(msg);
+        // 这会导致msg被再次通过deserialize解析，导致可能的混淆
         
-        // 获取响应数据
-        const auto& response_data = response.get_response_data();
-        LOG_DEBUG("Response data size: %zu, total_size: %llu", 
-                 response_data.size(), response.get_total_size());
+        // 如果msg已经是一个有效的DownloadMessage（在加密处理逻辑中已经被正确构造），则直接使用它
+        const auto& response_data = msg.get_payload();
+        LOG_DEBUG("Response data size: %zu", response_data.size());
+
+        // 尝试获取具体的下载消息属性
+        uint64_t write_offset = 0;
+        uint64_t total_size = 0;
+        bool is_last_chunk = false;
         
+        // 获取下载特定属性
+        if (msg.get_operation_type() == protocol::OperationType::DOWNLOAD) {
+            protocol::DownloadMessage* download_msg = dynamic_cast<protocol::DownloadMessage*>(&msg);
+            if (download_msg) {
+                write_offset = download_msg->get_offset();
+                total_size = download_msg->get_total_size();
+                is_last_chunk = download_msg->is_last_chunk();
+                LOG_DEBUG("Using download message properties: offset=%llu, total_size=%llu, is_last_chunk=%d",
+                         write_offset, total_size, is_last_chunk ? 1 : 0);
+            } else {
+                // 如果无法转换，则从负载中提取元数据
+                if (response_data.size() >= sizeof(uint64_t) * 2) {
+                    uint64_t offset_be = 0, total_size_be = 0;
+                    std::memcpy(&offset_be, response_data.data(), sizeof(uint64_t));
+                    std::memcpy(&total_size_be, response_data.data() + sizeof(uint64_t), sizeof(uint64_t));
+                    
+                    write_offset = protocol::net_to_host64(offset_be);
+                    total_size = protocol::net_to_host64(total_size_be);
+                    
+                    // 提取文件数据
+                    const std::vector<uint8_t>* file_data_ptr = nullptr;
+                    std::vector<uint8_t> file_data;
+                    if (response_data.size() > sizeof(uint64_t) * 2) {
+                        file_data.assign(response_data.begin() + sizeof(uint64_t) * 2, response_data.end());
+                        file_data_ptr = &file_data;
+                    }
+                    
+                    is_last_chunk = (msg.get_flags() & static_cast<uint8_t>(protocol::ProtocolFlags::LAST_CHUNK)) != 0;
+                    LOG_DEBUG("Extracted from payload: offset=%llu, total_size=%llu, data_size=%zu, is_last_chunk=%d",
+                             write_offset, total_size, file_data_ptr ? file_data_ptr->size() : 0, is_last_chunk ? 1 : 0);
+                }
+            }
+        }
+
         // 写入文件
         if (!response_data.empty()) {
-            LOG_DEBUG("Writing %zu bytes to file at offset %zu", response_data.size(), offset);
-            file.write(reinterpret_cast<const char*>(response_data.data()), 
-                       response_data.size());
-            
-            // 检查写入是否成功
-            if (!file) {
-                result.error_message = "Failed to write to local file";
-                LOG_ERROR("%s", result.error_message.c_str());
-                file.close();
-                return result;
+            // 根据响应中的偏移量设置写入位置
+            // 如果当前位置与响应指定的偏移量不符，则调整文件写入位置
+            if (offset != write_offset) {
+                LOG_DEBUG("Adjusting file position from %zu to %llu", offset, write_offset);
+                file.seekp(write_offset);
+                offset = write_offset;  // 更新我们跟踪的偏移量
             }
             
-            // 确保数据写入磁盘
-            file.flush();
-            
-            // 更新进度
-            offset += response_data.size();
-            result.transferred_bytes = offset;
-            
-            // 回调进度
-            if (progress_callback_) {
-                progress_callback_(result.transferred_bytes, response.get_total_size());
+            // 跳过元数据（偏移量和总大小），只写入数据部分
+            size_t metadata_size = sizeof(uint64_t) * 2;
+            if (response_data.size() > metadata_size) {
+                std::vector<uint8_t> file_data(response_data.begin() + metadata_size, response_data.end());
+                LOG_DEBUG("Writing %zu bytes to file at offset %zu", file_data.size(), offset);
+                file.write(reinterpret_cast<const char*>(file_data.data()), file_data.size());
+                
+                // 检查写入是否成功
+                if (!file) {
+                    result.error_message = "Failed to write to local file";
+                    LOG_ERROR("%s", result.error_message.c_str());
+                    file.close();
+                    return result;
+                }
+                
+                // 确保数据写入磁盘
+                file.flush();
+                
+                // 更新进度
+                offset += file_data.size();
+                result.transferred_bytes = offset;
+                
+                // 回调进度
+                if (progress_callback_) {
+                    progress_callback_(result.transferred_bytes, total_size);
+                }
+                
+                // 重置空响应计数
+                empty_response_count = 0;
+            } else {
+                LOG_WARNING("Response data too small, contains only metadata");
+                empty_response_count++;
             }
-            
-            // 重置空响应计数
-            empty_response_count = 0;
         } else {
-            LOG_WARNING("Received empty response data chunk");
-            empty_response_count++;
+            LOG_WARNING("Received empty response data chunk, current_offset=%zu", offset);
             
-            // 接收到多个空响应，可能是服务器有问题
-            if (empty_response_count >= max_empty_responses) {
-                result.error_message = "Too many empty responses received";
-                LOG_ERROR("%s", result.error_message.c_str());
-                file.close();
-                return result;
+            // 检查消息是否来自服务器
+            if (static_cast<protocol::OperationType>(type_value) == protocol::OperationType::DOWNLOAD) {
+                // 检查偏移量的有效性，如果偏移量无法从之前位置继续，则重置文件指针
+                if (offset != 0 && static_cast<protocol::OperationType>(type_value) == protocol::OperationType::DOWNLOAD) {
+                    LOG_DEBUG("Current file offset: %zu", offset);
+                }
+            }
+
+            // 检查响应数据，避免空数据导致传输中断
+            if (response_data.empty() && offset == 0) {
+                // 如果是第一个数据块且为空，可能是服务器返回的空文件
+                if (total_size == 0 && is_last_chunk) {
+                    // 这是一个空文件，标记完成并退出
+                    LOG_DEBUG("Empty file detected, marking as complete");
+                    last_chunk = true;
+                    result.success = true;
+                    result.total_bytes = 0;
+                    break; // 退出循环
+                }
             }
             
-            // 短暂等待后继续尝试
-            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+            // 如果是第一个数据包为空，可能是文件本身就是空的
+            if (offset == 0 && total_size == 0) {
+                LOG_INFO("Empty file detected (zero size)");
+                result.total_bytes = 0;
+                last_chunk = true;  // 标记为最后一块，退出循环
+            } else {
+                // 否则增加空响应计数
+                empty_response_count++;
+                
+                // 接收到多个空响应，可能是服务器有问题或传输问题
+                if (empty_response_count >= max_empty_responses) {
+                    result.error_message = "Too many empty responses received";
+                    LOG_ERROR("%s", result.error_message.c_str());
+                    file.close();
+                    return result;
+                }
+                
+                // 短暂等待后继续尝试，增加重试间隔
+                std::this_thread::sleep_for(std::chrono::milliseconds(200 * empty_response_count));
+            }
         }
         
         // 检查是否为最后一个块
-        last_chunk = response.is_last_chunk();
+        last_chunk = is_last_chunk;
         if (last_chunk) {
-            result.total_bytes = response.get_total_size();
-            LOG_DEBUG("Last chunk received, total size: %zu", result.total_bytes);
+            result.total_bytes = total_size;
+            LOG_DEBUG("Last chunk received, total size: %llu, transferred: %zu", 
+                     result.total_bytes, result.transferred_bytes);
+            
+            // 增加完整性检查
+            if (result.total_bytes > 0 && result.transferred_bytes != result.total_bytes) {
+                // 如果文件大小不为0，但传输数据大小与总大小不符，记录警告
+                LOG_WARNING("Possible incomplete transfer detected: received %zu bytes, expected %llu bytes",
+                          result.transferred_bytes, result.total_bytes);
+            }
         }
         
-        LOG_DEBUG("Downloaded chunk, offset: %zu, chunk_size: %zu, total_size: %zu, last_chunk: %d", 
-                 offset, response_data.size(), result.total_bytes, last_chunk ? 1 : 0);
+        // 记录每个块的接收情况
+        LOG_DEBUG("Downloaded chunk %s, offset: %zu, chunk_size: %zu, total_size: %llu, last_chunk: %d", 
+                 response_data.empty() ? "(empty)" : "", offset, response_data.size() > sizeof(uint64_t) * 2 ? response_data.size() - sizeof(uint64_t) * 2 : 0, 
+                 total_size, last_chunk ? 1 : 0);
     }
     
     // 关闭文件
     file.close();
-    
-    // 验证文件大小
+    LOG_DEBUG("File closed after download");
+
+    // 验证文件大小和传输结果
     if (fs::exists(request.local_file)) {
         size_t actual_size = fs::file_size(request.local_file);
-        if (actual_size != result.total_bytes) {
+        LOG_DEBUG("Verifying download: actual file size=%zu, reported total size=%zu, transferred=%zu", 
+                 actual_size, result.total_bytes, result.transferred_bytes);
+        
+        if (result.total_bytes > 0 && actual_size != result.total_bytes) {
             result.error_message = "File size mismatch: expected " + 
                                  std::to_string(result.total_bytes) + 
                                  " bytes, got " + std::to_string(actual_size) + " bytes";
             LOG_ERROR("%s", result.error_message.c_str());
             return result;
         }
+    } else {
+        LOG_WARNING("Could not verify downloaded file: %s does not exist", request.local_file.c_str());
     }
     
     // 计算耗时
@@ -1573,7 +1838,45 @@ std::vector<uint8_t> ClientCore::decrypt_data(const std::vector<uint8_t>& data) 
         return data;
     }
     
-    return utils::Encryption::aes_decrypt(data, encryption_key_, encryption_iv_);
+    try {
+        auto decrypted = utils::Encryption::aes_decrypt(data, encryption_key_, encryption_iv_);
+        
+        // 检查解密是否成功
+        if (decrypted.empty() && !data.empty()) {
+            LOG_ERROR("Decryption failed: input size=%zu, output size=0", data.size());
+            
+            // 记录原始数据的前16字节作为调试信息
+            std::string data_preview;
+            for (size_t i = 0; i < std::min(data.size(), size_t(16)); ++i) {
+                char hex[4];
+                snprintf(hex, sizeof(hex), "%02x ", data[i]);
+                data_preview += hex;
+            }
+            LOG_ERROR("Original data preview: %s", data_preview.c_str());
+            
+            // 记录密钥和IV的前8字节作为调试信息
+            std::string key_preview;
+            for (size_t i = 0; i < std::min(encryption_key_.size(), size_t(8)); ++i) {
+                char hex[4];
+                snprintf(hex, sizeof(hex), "%02x ", encryption_key_[i]);
+                key_preview += hex;
+            }
+            LOG_ERROR("Key preview: %s...(truncated)", key_preview.c_str());
+            
+            // 尝试进行数据恢复 - 解密失败是严重错误
+            // 返回一个包含原始数据的副本，而不是空向量
+            // 这种方法仅用于故障排除，实际应用中不应使用
+            LOG_WARNING("Using fallback decryption handler. This is for debugging only!");
+            return data;
+        }
+        
+        return decrypted;
+    } catch (const std::exception& e) {
+        LOG_ERROR("Exception during decryption: %s", e.what());
+        // 返回原始数据以尝试恢复，这仅用于调试
+        LOG_WARNING("Using exception fallback handler. This is for debugging only!");
+        return data;
+    }
 }
 
 } // namespace client

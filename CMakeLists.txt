@@ -29,6 +29,24 @@ endif()
 find_package(ZLIB REQUIRED)
 find_package(Threads REQUIRED)
 
+# 查找jsoncpp库
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(JSONCPP jsoncpp)
+if(NOT JSONCPP_FOUND)
+    message(STATUS "jsoncpp not found via pkg-config. Trying to find manually...")
+    # 修正jsoncpp的包含路径
+    set(JSONCPP_INCLUDE_DIRS "/usr/include/jsoncpp")
+    find_library(JSONCPP_LIBRARIES
+            NAMES jsoncpp
+            PATHS /usr/lib /usr/local/lib)
+    if(JSONCPP_INCLUDE_DIRS AND JSONCPP_LIBRARIES)
+        set(JSONCPP_FOUND TRUE)
+        message(STATUS "Found jsoncpp: ${JSONCPP_LIBRARIES}")
+    else()
+        message(FATAL_ERROR "jsoncpp library not found. Please install jsoncpp development package.")
+    endif()
+endif()
+
 # 添加子目录
 add_subdirectory(src)
 

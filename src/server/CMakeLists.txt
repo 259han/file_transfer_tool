@@ -3,6 +3,8 @@ add_library(server_core
     core/server_core.cpp
     handlers/connection_handler.cpp
     handlers/file_handler.cpp
+    handlers/file_lock_manager.cpp
+    handlers/file_version.cpp
     session/session_manager.cpp
 )
 
@@ -12,6 +14,7 @@ target_include_directories(server_core
         ${CMAKE_SOURCE_DIR}/include
     PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}
+        ${JSONCPP_INCLUDE_DIRS}
 )
 
 # 添加依赖
@@ -21,6 +24,7 @@ target_link_libraries(server_core
         common_network
         common_utils
         Threads::Threads
+        ${JSONCPP_LIBRARIES}
 )
 
 # 创建可执行文件

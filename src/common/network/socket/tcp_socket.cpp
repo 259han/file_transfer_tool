@@ -695,7 +695,24 @@ SocketError TcpSocket::send_all(const void* data, size_t len) {
         if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) {
             last_error_ = SocketError::CLOSED;
             connected_ = false;
-            LOG_ERROR("send_all: socket error: %s (revents=0x%x)", strerror(errno), pfd.revents);
+            
+            // 查询底层socket错误
+            int sock_err = 0;
+            socklen_t sock_err_len = sizeof(sock_err);
+            if (getsockopt(sockfd_, SOL_SOCKET, SO_ERROR, &sock_err, &sock_err_len) == 0 && sock_err != 0) {
+                LOG_ERROR("send_all: socket error: %s (revents=0x%x, sock_err=%d)", 
+                         strerror(sock_err), pfd.revents, sock_err);
+            } else {
+                LOG_ERROR("send_all: socket error: %s (revents=0x%x)", 
+                         strerror(errno), pfd.revents);
+            }
+            
+            // 关闭socket以防止资源泄漏
+            if (sockfd_ >= 0) {
+                ::close(sockfd_);
+                sockfd_ = -1;
+            }
+            
             return last_error_;
         }
         
@@ -715,13 +732,20 @@ SocketError TcpSocket::send_all(const void* data, size_t len) {
                 }
                 
                 // 短暂休眠后继续
-                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                std::this_thread::sleep_for(std::chrono::milliseconds(50 * retry_count));
                 continue;
-            } else if (errno == EPIPE || errno == ECONNRESET) {
+            } else if (errno == EPIPE || errno == ECONNRESET || errno == ECONNABORTED) {
                 // 连接被对端关闭
                 last_error_ = SocketError::CLOSED;
                 connected_ = false;
                 LOG_ERROR("send_all: connection closed by peer: %s (errno=%d)", strerror(errno), errno);
+                
+                // 关闭socket以防止资源泄漏
+                if (sockfd_ >= 0) {
+                    ::close(sockfd_);
+                    sockfd_ = -1;
+                }
+                
                 return last_error_;
             } else {
                 // 其他错误视为严重错误
@@ -734,6 +758,13 @@ SocketError TcpSocket::send_all(const void* data, size_t len) {
             last_error_ = SocketError::CLOSED;
             connected_ = false;
             LOG_ERROR("send_all: connection closed (sent 0 bytes)");
+            
+            // 关闭socket以防止资源泄漏
+            if (sockfd_ >= 0) {
+                ::close(sockfd_);
+                sockfd_ = -1;
+            }
+            
             return last_error_;
         }
         
@@ -836,7 +867,24 @@ SocketError TcpSocket::recv_all(void* buffer, size_t len) {
         if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) {
             last_error_ = SocketError::CLOSED;
             connected_ = false;
-            LOG_ERROR("recv_all: socket error: %s (revents=0x%x)", strerror(errno), pfd.revents);
+            
+            // 查询底层socket错误
+            int sock_err = 0;
+            socklen_t sock_err_len = sizeof(sock_err);
+            if (getsockopt(sockfd_, SOL_SOCKET, SO_ERROR, &sock_err, &sock_err_len) == 0 && sock_err != 0) {
+                LOG_ERROR("recv_all: socket error: %s (revents=0x%x, sock_err=%d)", 
+                         strerror(sock_err), pfd.revents, sock_err);
+            } else {
+                LOG_ERROR("recv_all: socket error: %s (revents=0x%x)", 
+                         strerror(errno), pfd.revents);
+            }
+            
+            // 关闭socket以防止资源泄漏
+            if (sockfd_ >= 0) {
+                ::close(sockfd_);
+                sockfd_ = -1;
+            }
+            
             return last_error_;
         }
         
@@ -856,13 +904,20 @@ SocketError TcpSocket::recv_all(void* buffer, size_t len) {
                 }
                 
                 // 短暂休眠后继续
-                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                std::this_thread::sleep_for(std::chrono::milliseconds(50 * retry_count));
                 continue;
-            } else if (errno == ECONNRESET) {
+            } else if (errno == ECONNRESET || errno == ECONNABORTED) {
                 // 连接被对端重置
                 last_error_ = SocketError::CLOSED;
                 connected_ = false;
                 LOG_ERROR("recv_all: connection reset by peer: %s (errno=%d)", strerror(errno), errno);
+                
+                // 关闭socket以防止资源泄漏
+                if (sockfd_ >= 0) {
+                    ::close(sockfd_);
+                    sockfd_ = -1;
+                }
+                
                 return last_error_;
             } else {
                 // 其他错误视为严重错误
@@ -874,7 +929,14 @@ SocketError TcpSocket::recv_all(void* buffer, size_t len) {
             // 接收0字节表示对方已关闭连接
             last_error_ = SocketError::CLOSED;
             connected_ = false;
-            LOG_INFO("recv_all: connection closed by peer");
+            LOG_ERROR("recv_all: connection closed by peer");
+            
+            // 关闭socket以防止资源泄漏
+            if (sockfd_ >= 0) {
+                ::close(sockfd_);
+                sockfd_ = -1;
+            }
+            
             return last_error_;
         }
         

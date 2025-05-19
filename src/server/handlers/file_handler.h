@@ -6,6 +6,8 @@
 #include <fstream>
 #include "../../common/protocol/messages/upload_message.h"
 #include "../../common/protocol/messages/download_message.h"
+#include "file_lock_manager.h"
+#include "file_version.h"
 
 namespace ft {
 namespace server {
@@ -78,16 +80,44 @@ public:
      */
     bool delete_file(const std::string& filename);
     
+    /**
+     * @brief 获取文件版本列表
+     * @param filename 文件名
+     * @return 版本列表
+     */
+    std::vector<FileVersionInfo> get_file_versions(const std::string& filename);
+    
+    /**
+     * @brief 恢复文件到指定版本
+     * @param filename 文件名
+     * @param version 版本号
+     * @return 是否恢复成功
+     */
+    bool restore_file_version(const std::string& filename, size_t version);
+    
 private:
     /**
-     * @brief 获取文件的完整路径
+     * @brief 获取文件完整路径
      * @param filename 文件名
      * @return 完整路径
      */
     std::string get_full_path(const std::string& filename) const;
     
+    /**
+     * @brief 安全写入文件（使用临时文件和原子重命名）
+     * @param file_path 目标文件路径
+     * @param data 文件数据
+     * @param size 数据大小
+     * @param offset 写入偏移量
+     * @return 操作结果
+     */
+    FileOperationResult safe_write_file(const std::string& file_path, 
+                                      const void* data, 
+                                      size_t size, 
+                                      uint64_t offset);
+
 private:
-    std::string storage_path_;
+    std::string storage_path_;  // 存储路径
 };
 
 } // namespace server

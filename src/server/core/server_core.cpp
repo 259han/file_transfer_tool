@@ -4,12 +4,19 @@
 #include "../../common/protocol/messages/key_exchange_message.h"
 #include "../../common/utils/crypto/encryption.h"
 #include "../session/session_manager.h"
+#include "../../common/utils/logging/logger.h"
+#include "../handlers/file_lock_manager.h"
+#include "../handlers/file_version.h"
 #include <filesystem>
 #include <fstream>
+#include <iostream>
+#include <random>
+#include <thread>
 #include <chrono>
 #include <cstring>
 #include <openssl/dh.h>
 #include <openssl/bn.h>
+#include <openssl/engine.h>
 
 namespace fs = std::filesystem;
 
@@ -448,6 +455,40 @@ bool ClientSession::handle_upload(const std::vector<uint8_t>& buffer) {
             fs::create_directories(storage_path);
         }
         
+        // 获取文件锁（上传需要独占锁）
+        FileLockManager& lock_manager = FileLockManager::instance();
+        if (!lock_manager.acquire_lock(file_path.string(), FileLockType::EXCLUSIVE)) {
+            LOG_ERROR("Session %zu: Failed to acquire exclusive lock for file: %s", session_id_, filename.c_str());
+            
+            // 发送错误响应
+            protocol::Message error_response(protocol::OperationType::ERROR);
+            std::string error_msg = "Failed to acquire file lock: " + filename;
+            error_response.set_payload(error_msg.data(), error_msg.size());
+            
+            std::vector<uint8_t> response_buffer;
+            error_response.encode(response_buffer);
+            
+            try {
+                socket_->send_all(response_buffer.data(), response_buffer.size());
+            } catch (const std::exception& e) {
+                LOG_ERROR("Session %zu: Exception while sending error response: %s", session_id_, e.what());
+            }
+            
+            return false;
+        }
+        
+        // 如果是第一个块且文件已存在，创建版本备份
+        if (offset == 0 && fs::exists(file_path)) {
+            try {
+                FileVersionManager::instance().create_version(file_path.string());
+                LOG_INFO("Session %zu: Created version backup for file %s before overwrite", 
+                        session_id_, filename.c_str());
+            } catch (const std::exception& e) {
+                LOG_WARNING("Session %zu: Failed to create version backup: %s", session_id_, e.what());
+                // 继续处理，这不是致命错误
+            }
+        }
+        
         // 打开文件
         std::ofstream file;
         if (offset == 0) {
@@ -561,17 +602,42 @@ bool ClientSession::handle_upload(const std::vector<uint8_t>& buffer) {
         }
         
         // 发送响应
-        network::SocketError err = socket_->send_all(response_buffer.data(), response_buffer.size());
-        if (err != network::SocketError::SUCCESS) {
-            LOG_ERROR("Session %zu: Failed to send upload response: %d", session_id_, static_cast<int>(err));
+        try {
+            network::SocketError err = socket_->send_all(response_buffer.data(), response_buffer.size());
+            if (err != network::SocketError::SUCCESS) {
+                LOG_ERROR("Session %zu: Failed to send upload response: %d", 
+                         session_id_, static_cast<int>(err));
+                lock_manager.release_lock(file_path.string());  // 确保锁被释放
+                return false;
+            }
+        } catch (const std::exception& e) {
+            LOG_ERROR("Session %zu: Exception while sending upload response: %s", session_id_, e.what());
+            lock_manager.release_lock(file_path.string());  // 确保锁被释放
             return false;
         }
-
-        LOG_INFO("Session %zu: Upload chunk processed successfully for file %s", session_id_, filename.c_str());
-        return true;
         
+        LOG_INFO("Session %zu: Upload chunk processed successfully for file %s", session_id_, filename.c_str());
+
+        // 如果是最后一块，清理旧版本
+        if (is_last_chunk) {
+            try {
+                FileVersionManager::instance().cleanup_old_versions(file_path.string());
+                LOG_INFO("Session %zu: Cleaned up old versions for file %s", session_id_, filename.c_str());
+            } catch (const std::exception& e) {
+                LOG_WARNING("Session %zu: Failed to cleanup old versions: %s", session_id_, e.what());
+                // 不是致命错误，继续处理
+            }
+        }
+        
+        // 释放文件锁
+        lock_manager.release_lock(file_path.string());
+        return true;
     } catch (const std::exception& e) {
-        LOG_ERROR("Session %zu: Exception while handling upload: %s", session_id_, e.what());
+        LOG_ERROR("Session %zu: Exception in handle_upload: %s", session_id_, e.what());
+        
+        // 错误发生，忽略文件锁清理中的异常
+        // 由于在catch块中无法访问file_path变量，我们不进行锁的释放
+        // FileLockManager在析构时会自动清理未释放的锁
         return false;
     }
 }
@@ -648,6 +714,29 @@ bool ClientSession::handle_download(const std::vector<uint8_t>& buffer) {
             std::vector<uint8_t> response_buffer;
             error_response.encode(response_buffer);
             
+            try {
+                socket_->send_all(response_buffer.data(), response_buffer.size());
+                LOG_DEBUG("Session %zu: Sent error response: File not found", session_id_);
+            } catch (const std::exception& e) {
+                LOG_ERROR("Session %zu: Exception while sending error response: %s", session_id_, e.what());
+            }
+            
+            return false;
+        }
+        
+        // 获取文件共享锁（读锁）
+        FileLockManager& lock_manager = FileLockManager::instance();
+        if (!lock_manager.acquire_lock(file_path.string(), FileLockType::SHARED)) {
+            LOG_ERROR("Session %zu: Failed to acquire shared lock for file: %s", session_id_, filename.c_str());
+            
+            // 发送错误响应
+            protocol::Message error_response(protocol::OperationType::ERROR);
+            std::string error_msg = "Failed to acquire file lock: " + filename;
+            error_response.set_payload(error_msg.data(), error_msg.size());
+            
+            std::vector<uint8_t> response_buffer;
+            error_response.encode(response_buffer);
+            
             socket_->send_all(response_buffer.data(), response_buffer.size());
             return false;
         }
@@ -684,6 +773,7 @@ bool ClientSession::handle_download(const std::vector<uint8_t>& buffer) {
             // 创建下载响应消息，空数据
             protocol::DownloadMessage response_msg;
             response_msg.set_response_data(nullptr, 0, file_size, true);
+            response_msg.offset_ = current_offset;
             
             // 编码消息
             std::vector<uint8_t> response_buffer;
@@ -723,6 +813,12 @@ bool ClientSession::handle_download(const std::vector<uint8_t>& buffer) {
             size_t bytes_read = static_cast<size_t>(file.gcount());
             LOG_DEBUG("Session %zu: Actually read %zu bytes", session_id_, bytes_read);
             
+            // 如果读取失败，退出循环
+            if (bytes_read == 0 && !file.eof()) {
+                LOG_ERROR("Session %zu: Failed to read file data at offset %llu", session_id_, current_offset);
+                break;
+            }
+            
             // 调整数据大小为实际读取的大小
             file_data.resize(bytes_read);
             
@@ -743,45 +839,102 @@ bool ClientSession::handle_download(const std::vector<uint8_t>& buffer) {
             // 创建下载响应消息
             protocol::DownloadMessage response_msg;
             response_msg.set_response_data(file_data.data(), file_data.size(), file_size, is_last_chunk);
+            response_msg.set_offset(current_offset);
             
+            LOG_DEBUG("Session %zu: Created download response with offset=%llu, size=%zu, total_size=%llu, is_last=%d",
+                      session_id_, current_offset, file_data.size(), file_size, is_last_chunk ? 1 : 0);
+
             // 编码消息
             std::vector<uint8_t> response_buffer;
-            
+
             // 如果启用了加密，则加密响应
             if (encryption_enabled_ && key_exchange_completed_) {
                 // 首先编码不带加密标志的消息
                 if (!response_msg.encode(response_buffer)) {
                     LOG_ERROR("Session %zu: Failed to encode download response", session_id_);
+                    file.close();
+                    lock_manager.release_lock(file_path.string());
                     return false;
                 }
                 
                 // 获取原始消息数据（跳过头部）
-                std::vector<uint8_t> payload(response_buffer.begin() + sizeof(protocol::ProtocolHeader), 
-                                           response_buffer.end());
+                if (response_buffer.size() <= sizeof(protocol::ProtocolHeader)) {
+                    LOG_ERROR("Session %zu: Encoded response buffer too small", session_id_);
+                    file.close();
+                    lock_manager.release_lock(file_path.string());
+                    return false;
+                }
+                
+                // 创建一个副本用于加密，避免直接修改response_buffer
+                std::vector<uint8_t> payload_to_encrypt(response_buffer.begin() + sizeof(protocol::ProtocolHeader), 
+                                                      response_buffer.end());
+                
+                // 加密负载前记录一些调试信息
+                if (payload_to_encrypt.size() > 0) {
+                    std::string data_preview;
+                    for (size_t i = 0; i < std::min(payload_to_encrypt.size(), size_t(16)); ++i) {
+                        char hex[4];
+                        snprintf(hex, sizeof(hex), "%02x ", payload_to_encrypt[i]);
+                        data_preview += hex;
+                    }
+                    LOG_DEBUG("Session %zu: Pre-encryption data preview: %s", session_id_, data_preview.c_str());
+                }
                 
                 // 加密负载
-                std::vector<uint8_t> encrypted_payload = encrypt_data(payload);
+                LOG_DEBUG("Session %zu: Encrypting download response payload of size %zu, offset=%llu, total_size=%llu", 
+                         session_id_, payload_to_encrypt.size(), current_offset, file_size);
+                std::vector<uint8_t> encrypted_payload = encrypt_data(payload_to_encrypt);
+                
+                // 检查加密是否成功
+                if (encrypted_payload.empty() && !payload_to_encrypt.empty()) {
+                    LOG_ERROR("Session %zu: Encryption failed: input=%zu, output=0", 
+                             session_id_, payload_to_encrypt.size());
+                    file.close();
+                    lock_manager.release_lock(file_path.string());
+                    return false;
+                }
                 
                 // 创建新的带加密标志的消息
                 protocol::Message encrypted_msg(protocol::OperationType::DOWNLOAD);
-                encrypted_msg.set_flags(static_cast<uint8_t>(protocol::ProtocolFlags::ENCRYPTED) | 
-                                      (is_last_chunk ? static_cast<uint8_t>(protocol::ProtocolFlags::LAST_CHUNK) : 0));
+                
+                // 设置标志位：包括加密标志和最后一块标志（如果适用）
+                uint8_t flags = static_cast<uint8_t>(protocol::ProtocolFlags::ENCRYPTED);
+                if (is_last_chunk) {
+                    flags |= static_cast<uint8_t>(protocol::ProtocolFlags::LAST_CHUNK);
+                }
+                encrypted_msg.set_flags(flags);
                 
                 // 直接设置负载，避免再添加元数据
                 encrypted_msg.set_payload(encrypted_payload.data(), encrypted_payload.size());
                 
-                // 编码加密消息
+                // 加密后记录一些调试信息
+                if (encrypted_payload.size() > 0) {
+                    std::string data_preview;
+                    for (size_t i = 0; i < std::min(encrypted_payload.size(), size_t(16)); ++i) {
+                        char hex[4];
+                        snprintf(hex, sizeof(hex), "%02x ", encrypted_payload[i]);
+                        data_preview += hex;
+                    }
+                    LOG_DEBUG("Session %zu: Post-encryption data preview: %s", session_id_, data_preview.c_str());
+                }
+                
+                // 编码加密后的消息
                 response_buffer.clear();
                 if (!encrypted_msg.encode(response_buffer)) {
                     LOG_ERROR("Session %zu: Failed to encode encrypted download response", session_id_);
+                    file.close();
+                    lock_manager.release_lock(file_path.string());
                     return false;
                 }
                 
-                LOG_DEBUG("Session %zu: Response encrypted successfully", session_id_);
+                LOG_DEBUG("Session %zu: Response encrypted successfully: buffer_size=%zu", 
+                          session_id_, response_buffer.size());
             } else {
                 // 不使用加密
                 if (!response_msg.encode(response_buffer)) {
                     LOG_ERROR("Session %zu: Failed to encode download response", session_id_);
+                    file.close();
+                    lock_manager.release_lock(file_path.string());
                     return false;
                 }
             }
@@ -790,11 +943,53 @@ bool ClientSession::handle_download(const std::vector<uint8_t>& buffer) {
                      session_id_, file_data.size(), response_buffer.size(), is_last_chunk ? 1 : 0,
                      response_msg.get_flags());
             
-            // 发送响应
-            network::SocketError err = socket_->send_all(response_buffer.data(), response_buffer.size());
-            if (err != network::SocketError::SUCCESS) {
-                LOG_ERROR("Session %zu: Failed to send download response: %d", 
-                          session_id_, static_cast<int>(err));
+            // 发送响应前检查连接状态
+            if (!socket_ || !socket_->is_connected()) {
+                LOG_ERROR("Session %zu: Socket disconnected before sending response", session_id_);
+                file.close();
+                lock_manager.release_lock(file_path.string());
+                return false;
+            }
+            
+            // 发送响应，添加重试逻辑
+            int send_retry = 0;
+            const int max_send_retries = 3;
+            network::SocketError err;
+            bool send_success = false;
+            
+            while (send_retry < max_send_retries && !send_success) {
+                // 每次发送前检查连接状态
+                if (!socket_ || !socket_->is_connected()) {
+                    LOG_ERROR("Session %zu: Socket disconnected during send retry %d", session_id_, send_retry + 1);
+                    break;
+                }
+                
+                err = socket_->send_all(response_buffer.data(), response_buffer.size());
+                if (err == network::SocketError::SUCCESS) {
+                    send_success = true;
+                    LOG_DEBUG("Session %zu: Chunk sent successfully on try %d", session_id_, send_retry + 1);
+                } else {
+                    send_retry++;
+                    LOG_WARNING("Session %zu: Failed to send download response on try %d: %d", 
+                              session_id_, send_retry, static_cast<int>(err));
+                    
+                    if (err == network::SocketError::CLOSED) {
+                        LOG_ERROR("Session %zu: Socket closed during send, aborting", session_id_);
+                        break;
+                    }
+                    
+                    if (send_retry < max_send_retries) {
+                        // 短暂延迟后重试
+                        std::this_thread::sleep_for(std::chrono::milliseconds(50 * send_retry));
+                    }
+                }
+            }
+            
+            if (!send_success) {
+                LOG_ERROR("Session %zu: Failed to send download response after %d retries", 
+                          session_id_, max_send_retries);
+                file.close();
+                lock_manager.release_lock(file_path.string());
                 return false;
             }
             
@@ -805,6 +1000,15 @@ bool ClientSession::handle_download(const std::vector<uint8_t>& buffer) {
             current_offset += bytes_read;
             remaining -= bytes_read;
             total_sent += bytes_read;
+            
+            // 在返回客户端之前小暂停，给客户端处理数据的时间，根据数据大小动态调整延迟
+            std::this_thread::sleep_for(std::chrono::milliseconds(bytes_read > 100000 ? 50 : 10));
+            
+            // 如果是最后一个块，退出循环
+            if (is_last_chunk) {
+                LOG_DEBUG("Session %zu: Last chunk sent, exiting download loop", session_id_);
+                break;
+            }
             
             // 如果读取的数据小于请求的块大小，说明已经到达文件末尾
             if (bytes_read < current_chunk_size) {
@@ -818,10 +1022,18 @@ bool ClientSession::handle_download(const std::vector<uint8_t>& buffer) {
         LOG_INFO("Session %zu: Download completed for file %s, total sent: %zu bytes",
                  session_id_, filename.c_str(), total_sent);
         
+        // 释放文件锁
+        lock_manager.release_lock(file_path.string());
+        LOG_DEBUG("Session %zu: Released shared lock for file: %s", session_id_, filename.c_str());
+        
         return true;
         
     } catch (const std::exception& e) {
         LOG_ERROR("Session %zu: Exception while handling download: %s", session_id_, e.what());
+        
+        // 错误发生，忽略文件锁清理中的异常
+        // 由于在catch块中无法访问file_path变量，我们不进行锁的释放
+        // FileLockManager在析构时会自动清理未释放的锁
         return false;
     }
 }

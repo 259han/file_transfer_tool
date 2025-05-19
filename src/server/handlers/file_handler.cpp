@@ -2,6 +2,10 @@
 #include "../../common/utils/logging/logger.h"
 #include <filesystem>
 #include <fstream>
+#include <sstream>
+#include <chrono>
+#include <random>
+#include <unistd.h>
 
 namespace fs = std::filesystem;
 
@@ -46,46 +50,38 @@ FileOperationResult FileHandler::handle_upload(const protocol::UploadMessage& up
             fs::create_directories(path.parent_path());
         }
         
-        // 打开文件
-        std::ofstream file;
-        if (offset == 0) {
-            // 新文件，覆盖写入
-            file.open(file_path, std::ios::binary | std::ios::trunc);
-        } else {
-            // 追加写入
-            file.open(file_path, std::ios::binary | std::ios::in | std::ios::out);
-            file.seekp(offset);
-        }
-        
-        if (!file.is_open()) {
-            result.error_message = "Failed to open file for writing: " + file_path;
-            LOG_ERROR("%s", result.error_message.c_str());
+        // 获取文件锁 (上传需要独占锁)
+        FileLockManager& lock_manager = FileLockManager::instance();
+        if (!lock_manager.acquire_lock(file_path, FileLockType::EXCLUSIVE)) {
+            result.error_message = "Failed to acquire exclusive lock for file: " + filename;
+            LOG_ERROR("%s, possibly locked by another user", result.error_message.c_str());
             return result;
         }
         
-        // 写入文件数据
-        const std::vector<uint8_t>& file_data = upload_msg.get_file_data();
-        if (!file_data.empty()) {
-            file.write(reinterpret_cast<const char*>(file_data.data()), file_data.size());
-            if (!file) {
-                result.error_message = "Failed to write file data";
-                LOG_ERROR("%s", result.error_message.c_str());
-                return result;
-            }
+        // 创建版本记录 (仅当是第一个块并且文件已存在时)
+        if (offset == 0 && fs::exists(file_path)) {
+            FileVersionManager::instance().create_version(file_path);
+            LOG_INFO("Created version backup for file before overwrite: %s", filename.c_str());
         }
         
-        file.close();
+        // 安全写入文件数据
+        const std::vector<uint8_t>& file_data = upload_msg.get_file_data();
+        result = safe_write_file(file_path, file_data.data(), file_data.size(), offset);
         
-        // 设置结果
-        result.success = true;
-        result.bytes_processed = file_data.size();
+        // 如果是最后一块，清理旧版本
+        if (is_last_chunk && result.success) {
+            FileVersionManager::instance().cleanup_old_versions(file_path);
+        }
         
-        LOG_INFO("Upload chunk processed successfully for file %s, bytes: %llu", 
-                filename.c_str(), result.bytes_processed);
+        // 释放文件锁
+        lock_manager.release_lock(file_path);
         
     } catch (const std::exception& e) {
         result.error_message = "Exception while handling upload: " + std::string(e.what());
         LOG_ERROR("%s", result.error_message.c_str());
+        
+        // 确保锁被释放
+        FileLockManager::instance().release_lock(get_full_path(upload_msg.get_filename()));
     }
     
     return result;
@@ -114,11 +110,20 @@ FileOperationResult FileHandler::handle_download(const protocol::DownloadMessage
             return result;
         }
         
+        // 获取文件锁 (下载需要共享锁)
+        FileLockManager& lock_manager = FileLockManager::instance();
+        if (!lock_manager.acquire_lock(file_path, FileLockType::SHARED)) {
+            result.error_message = "Failed to acquire shared lock for file: " + filename;
+            LOG_ERROR("%s", result.error_message.c_str());
+            return result;
+        }
+        
         // 获取文件大小
         uint64_t file_size = fs::file_size(file_path);
         
         // 检查偏移量是否有效
         if (offset >= file_size) {
+            lock_manager.release_lock(file_path);
             result.error_message = "Invalid offset: " + std::to_string(offset);
             LOG_ERROR("%s", result.error_message.c_str());
             return result;
@@ -127,6 +132,7 @@ FileOperationResult FileHandler::handle_download(const protocol::DownloadMessage
         // 打开文件
         std::ifstream file(file_path, std::ios::binary);
         if (!file.is_open()) {
+            lock_manager.release_lock(file_path);
             result.error_message = "Failed to open file for reading: " + file_path;
             LOG_ERROR("%s", result.error_message.c_str());
             return result;
@@ -175,6 +181,9 @@ FileOperationResult FileHandler::handle_download(const protocol::DownloadMessage
         
         file.close();
         
+        // 释放文件锁
+        lock_manager.release_lock(file_path);
+        
         // 设置结果
         result.success = true;
         
@@ -184,6 +193,9 @@ FileOperationResult FileHandler::handle_download(const protocol::DownloadMessage
     } catch (const std::exception& e) {
         result.error_message = "Exception while handling download: " + std::string(e.what());
         LOG_ERROR("%s", result.error_message.c_str());
+        
+        // 确保锁被释放
+        FileLockManager::instance().release_lock(get_full_path(download_msg.get_filename()));
     }
     
     return result;
@@ -204,16 +216,157 @@ uint64_t FileHandler::get_file_size(const std::string& filename) const {
 
 bool FileHandler::delete_file(const std::string& filename) {
     try {
-        return fs::remove(get_full_path(filename));
+        std::string file_path = get_full_path(filename);
+        
+        // 获取独占锁
+        FileLockManager& lock_manager = FileLockManager::instance();
+        if (!lock_manager.acquire_lock(file_path, FileLockType::EXCLUSIVE)) {
+            LOG_ERROR("Failed to acquire lock for deletion: %s", filename.c_str());
+            return false;
+        }
+        
+        // 创建删除前的版本记录
+        if (fs::exists(file_path)) {
+            FileVersionManager::instance().create_version(file_path);
+            LOG_INFO("Created version backup before deletion: %s", filename.c_str());
+        }
+        
+        // 删除文件
+        bool success = fs::remove(file_path);
+        
+        // 释放锁
+        lock_manager.release_lock(file_path);
+        
+        return success;
     } catch (const std::exception& e) {
         LOG_ERROR("Failed to delete file: %s", e.what());
+        
+        // 确保锁被释放
+        try {
+            FileLockManager::instance().release_lock(get_full_path(filename));
+        } catch (...) {
+            // 忽略释放锁时的错误
+        }
+        
         return false;
     }
+}
+
+std::vector<FileVersionInfo> FileHandler::get_file_versions(const std::string& filename) {
+    std::string file_path = get_full_path(filename);
+    return FileVersionManager::instance().get_all_versions(file_path);
+}
+
+bool FileHandler::restore_file_version(const std::string& filename, size_t version) {
+    std::string file_path = get_full_path(filename);
+    
+    // 获取独占锁
+    FileLockManager& lock_manager = FileLockManager::instance();
+    if (!lock_manager.acquire_lock(file_path, FileLockType::EXCLUSIVE)) {
+        LOG_ERROR("Failed to acquire lock for version restore: %s", filename.c_str());
+        return false;
+    }
+    
+    // 恢复版本
+    bool success = FileVersionManager::instance().restore_version(file_path, version);
+    
+    // 释放锁
+    lock_manager.release_lock(file_path);
+    
+    return success;
 }
 
 std::string FileHandler::get_full_path(const std::string& filename) const {
     fs::path path(storage_path_);
     return (path / filename).string();
+}
+
+FileOperationResult FileHandler::safe_write_file(const std::string& file_path, 
+                                               const void* data, 
+                                               size_t size, 
+                                               uint64_t offset) {
+    FileOperationResult result;
+    
+    try {
+        // 如果是第一个块，使用临时文件和原子操作
+        if (offset == 0) {
+            // 创建临时文件路径
+            std::stringstream ss;
+            ss << file_path << ".tmp." << getpid() << "." 
+               << std::chrono::system_clock::now().time_since_epoch().count();
+            std::string temp_path = ss.str();
+            
+            // 打开临时文件
+            std::ofstream temp_file(temp_path, std::ios::binary | std::ios::trunc);
+            if (!temp_file.is_open()) {
+                result.error_message = "Failed to open temporary file: " + temp_path;
+                LOG_ERROR("%s", result.error_message.c_str());
+                return result;
+            }
+            
+            // 写入数据
+            if (size > 0) {
+                temp_file.write(reinterpret_cast<const char*>(data), size);
+                if (!temp_file) {
+                    result.error_message = "Failed to write to temporary file";
+                    LOG_ERROR("%s", result.error_message.c_str());
+                    temp_file.close();
+                    fs::remove(temp_path);  // 清理临时文件
+                    return result;
+                }
+            }
+            
+            temp_file.close();
+            
+            // 原子替换原文件
+            try {
+                fs::rename(temp_path, file_path);
+                LOG_INFO("Atomically replaced file: %s", file_path.c_str());
+            } catch (const std::exception& e) {
+                result.error_message = "Failed to rename temporary file: " + std::string(e.what());
+                LOG_ERROR("%s", result.error_message.c_str());
+                fs::remove(temp_path);  // 清理临时文件
+                return result;
+            }
+        } else {
+            // 追加写入模式
+            std::fstream file(file_path, std::ios::binary | std::ios::in | std::ios::out);
+            if (!file.is_open()) {
+                result.error_message = "Failed to open file for appending: " + file_path;
+                LOG_ERROR("%s", result.error_message.c_str());
+                return result;
+            }
+            
+            // 设置写入位置
+            file.seekp(offset);
+            
+            // 写入数据
+            if (size > 0) {
+                file.write(reinterpret_cast<const char*>(data), size);
+                if (!file) {
+                    result.error_message = "Failed to append to file";
+                    LOG_ERROR("%s", result.error_message.c_str());
+                    file.close();
+                    return result;
+                }
+            }
+            
+            file.close();
+        }
+        
+        // 设置结果
+        result.success = true;
+        result.bytes_processed = size;
+        
+        LOG_INFO("Safe write operation completed for %s, offset: %llu, size: %zu", 
+                file_path.c_str(), offset, size);
+        
+    } catch (const std::exception& e) {
+        result.error_message = "Exception in safe_write_file: " + std::string(e.what());
+        LOG_ERROR("%s", result.error_message.c_str());
+    }
+    
+    return result;
 }
 
 } // namespace server
