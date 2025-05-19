@@ -1,6 +1,7 @@
 #include "client_core.h"
 #include "../../common/protocol/messages/upload_message.h"
 #include "../../common/protocol/messages/download_message.h"
+#include "../../common/protocol/messages/key_exchange_message.h"
 #include "../../common/utils/crypto/encryption.h"
 #include <chrono>
 #include <fstream>
@@ -23,7 +24,9 @@ ClientCore::ClientCore()
       stop_heartbeat_(false),
       encryption_enabled_(false),
       encryption_key_(),
-      encryption_iv_() {
+      encryption_iv_(),
+      dh_private_key_(),
+      key_exchange_completed_(false) {
 }
 
 ClientCore::~ClientCore() {
@@ -41,9 +44,18 @@ bool ClientCore::initialize(utils::LogLevel log_level) {
 bool ClientCore::enable_encryption() {
     encryption_enabled_ = true;
     
-    // 生成随机密钥和IV
-    encryption_key_ = utils::Encryption::random_bytes(32); // AES-256使用32字节密钥
-    encryption_iv_ = utils::Encryption::random_bytes(16);  // AES-CBC使用16字节IV
+    // 在连接状态下需要进行密钥交换
+    if (is_connected_) {
+        if (!perform_key_exchange()) {
+            LOG_ERROR("Failed to perform key exchange, disabling encryption");
+            encryption_enabled_ = false;
+            key_exchange_completed_ = false;
+            return false;
+        }
+    } else {
+        // 未连接状态下仅设置标志位
+        key_exchange_completed_ = false;
+    }
     
     LOG_INFO("Encryption enabled with AES-256-CBC");
     return true;
@@ -151,6 +163,17 @@ bool ClientCore::connect(const ServerInfo& server) {
         // 标记为已连接
         is_connected_ = true;
         server_info_ = server;
+        
+        // 如果加密已启用，执行密钥交换
+        if (encryption_enabled_) {
+            LOG_INFO("Encryption is enabled, performing key exchange");
+            if (!perform_key_exchange()) {
+                LOG_ERROR("Failed to perform key exchange during connection");
+                is_connected_ = false;
+                socket_->close();
+                return false;
+            }
+        }
         
         // 发送初始心跳
         int heartbeat_retry = 0;
@@ -568,6 +591,172 @@ void ClientCore::disconnect() {
     is_connected_ = false;
 }
 
+bool ClientCore::perform_key_exchange() {
+    if (!is_connected_ || !socket_ || !socket_->is_connected()) {
+        LOG_ERROR("Cannot perform key exchange: not connected");
+        return false;
+    }
+    
+    try {
+        LOG_INFO("Starting key exchange process");
+        
+        // 生成DH参数和私钥
+        utils::DHParams dh_params = utils::Encryption::generate_dh_params(dh_private_key_);
+        if (dh_private_key_.empty() || dh_params.p.empty() || dh_params.g.empty() || dh_params.public_key.empty()) {
+            LOG_ERROR("Failed to generate DH parameters");
+            return false;
+        }
+        
+        // 创建客户端Hello消息
+        protocol::KeyExchangeMessage client_hello(protocol::KeyExchangePhase::CLIENT_HELLO);
+        
+        // 序列化DH参数
+        std::vector<uint8_t> params_data;
+        
+        // 写入p的长度和数据
+        uint32_t p_size = static_cast<uint32_t>(dh_params.p.size());
+        params_data.resize(sizeof(uint32_t));
+        std::memcpy(params_data.data(), &p_size, sizeof(uint32_t));
+        params_data.insert(params_data.end(), dh_params.p.begin(), dh_params.p.end());
+        
+        // 写入g的长度和数据
+        uint32_t g_size = static_cast<uint32_t>(dh_params.g.size());
+        size_t g_offset = params_data.size();
+        params_data.resize(g_offset + sizeof(uint32_t));
+        std::memcpy(params_data.data() + g_offset, &g_size, sizeof(uint32_t));
+        params_data.insert(params_data.end(), dh_params.g.begin(), dh_params.g.end());
+        
+        // 写入公钥的长度和数据
+        uint32_t pub_size = static_cast<uint32_t>(dh_params.public_key.size());
+        size_t pub_offset = params_data.size();
+        params_data.resize(pub_offset + sizeof(uint32_t));
+        std::memcpy(params_data.data() + pub_offset, &pub_size, sizeof(uint32_t));
+        params_data.insert(params_data.end(), dh_params.public_key.begin(), dh_params.public_key.end());
+        
+        client_hello.set_exchange_params(params_data);
+        
+        // 编码消息
+        std::vector<uint8_t> msg_buffer;
+        if (!client_hello.encode(msg_buffer)) {
+            LOG_ERROR("Failed to encode key exchange client hello message");
+            return false;
+        }
+        
+        // 发送消息
+        network::SocketError err = socket_->send_all(msg_buffer.data(), msg_buffer.size());
+        if (err != network::SocketError::SUCCESS) {
+            LOG_ERROR("Failed to send key exchange client hello: %d", static_cast<int>(err));
+            return false;
+        }
+        
+        LOG_INFO("Sent key exchange CLIENT_HELLO, waiting for SERVER_HELLO");
+        
+        // 接收服务器响应
+        protocol::ProtocolHeader header;
+        err = socket_->recv_all(&header, sizeof(header));
+        if (err != network::SocketError::SUCCESS) {
+            LOG_ERROR("Failed to receive key exchange response header: %d", static_cast<int>(err));
+            return false;
+        }
+        
+        // 检查魔数和类型
+        if (header.magic != protocol::PROTOCOL_MAGIC ||
+            static_cast<protocol::OperationType>(header.type) != protocol::OperationType::KEY_EXCHANGE) {
+            // 创建临时变量避免直接引用紧凑结构体中的字段
+            uint32_t magic_val = header.magic;
+            uint8_t type_val = header.type;
+            LOG_ERROR("Invalid key exchange response header: magic=0x%08x, type=%d", 
+                      magic_val, type_val);
+            return false;
+        }
+        
+        // 接收消息体
+        std::vector<uint8_t> response_buffer(sizeof(protocol::ProtocolHeader) + header.length);
+        std::memcpy(response_buffer.data(), &header, sizeof(protocol::ProtocolHeader));
+        
+        if (header.length > 0) {
+            err = socket_->recv_all(response_buffer.data() + sizeof(protocol::ProtocolHeader), header.length);
+            if (err != network::SocketError::SUCCESS) {
+                LOG_ERROR("Failed to receive key exchange response body: %d", static_cast<int>(err));
+                return false;
+            }
+        }
+        
+        // 解码响应
+        protocol::Message response_msg;
+        if (!response_msg.decode(response_buffer)) {
+            LOG_ERROR("Failed to decode key exchange response");
+            return false;
+        }
+        
+        protocol::KeyExchangeMessage server_hello(response_msg);
+        if (server_hello.get_exchange_phase() != protocol::KeyExchangePhase::SERVER_HELLO) {
+            LOG_ERROR("Invalid key exchange phase in server response: %d", 
+                      static_cast<int>(server_hello.get_exchange_phase()));
+            return false;
+        }
+        
+        // 解析服务器公钥
+        const std::vector<uint8_t>& server_params = server_hello.get_exchange_params();
+        if (server_params.empty()) {
+            LOG_ERROR("Empty server key exchange params");
+            return false;
+        }
+        
+        // 解析服务器公钥
+        if (server_params.size() < sizeof(uint32_t)) {
+            LOG_ERROR("Invalid server key exchange params size");
+            return false;
+        }
+        
+        // 读取服务器公钥长度
+        uint32_t server_key_size = 0;
+        std::memcpy(&server_key_size, server_params.data(), sizeof(uint32_t));
+        
+        if (server_params.size() < sizeof(uint32_t) + server_key_size) {
+            LOG_ERROR("Invalid server key exchange params: insufficient data");
+            return false;
+        }
+        
+        // 提取服务器公钥
+        std::vector<uint8_t> server_public_key(server_params.begin() + sizeof(uint32_t),
+                                              server_params.begin() + sizeof(uint32_t) + server_key_size);
+        
+        // 构建服务器DH参数
+        utils::DHParams server_dh_params;
+        server_dh_params.p = dh_params.p;      // 使用相同的p
+        server_dh_params.g = dh_params.g;      // 使用相同的g
+        server_dh_params.public_key = server_public_key; // 使用服务器的公钥
+        
+        // 计算共享密钥
+        std::vector<uint8_t> shared_key = utils::Encryption::compute_dh_shared_key(
+            server_dh_params, dh_private_key_);
+        
+        if (shared_key.empty()) {
+            LOG_ERROR("Failed to compute shared key");
+            return false;
+        }
+        
+        // 派生AES密钥和IV
+        utils::Encryption::derive_key_and_iv(shared_key, encryption_key_, encryption_iv_);
+        
+        if (encryption_key_.size() != 32 || encryption_iv_.size() != 16) {
+            LOG_ERROR("Invalid derived key or IV size: key=%zu, iv=%zu", 
+                      encryption_key_.size(), encryption_iv_.size());
+            return false;
+        }
+        
+        key_exchange_completed_ = true;
+        LOG_INFO("Key exchange completed successfully");
+        
+        return true;
+        
+    } catch (const std::exception& e) {
+        LOG_ERROR("Exception during key exchange: %s", e.what());
+        return false;
+    }
+}
+
 TransferResult ClientCore::upload(const TransferRequest& request) {
     TransferResult result;
     
@@ -640,10 +829,47 @@ TransferResult ClientCore::upload(const TransferRequest& request) {
             
             // 编码消息
             std::vector<uint8_t> msg_buffer;
-            if (!upload_msg.encode(msg_buffer)) {
-                result.error_message = "Failed to encode upload message";
-                LOG_ERROR("%s", result.error_message.c_str());
-                return result;
+            
+            // 如果启用了加密，设置加密标志并加密数据
+            if (encryption_enabled_ && key_exchange_completed_) {
+                // 设置加密标志
+                upload_msg.set_encrypted(true);
+                
+                // 编码原始消息
+                if (!upload_msg.encode(msg_buffer)) {
+                    result.error_message = "Failed to encode upload message";
+                    LOG_ERROR("%s", result.error_message.c_str());
+                    return result;
+                }
+                
+                // 获取负载（跳过协议头）
+                std::vector<uint8_t> payload(msg_buffer.begin() + sizeof(protocol::ProtocolHeader), 
+                                           msg_buffer.end());
+                
+                // 加密负载
+                std::vector<uint8_t> encrypted_payload = encrypt_data(payload);
+                
+                // 创建新的带加密标志的消息
+                protocol::Message encrypted_msg(protocol::OperationType::UPLOAD);
+                encrypted_msg.set_flags(static_cast<uint8_t>(protocol::ProtocolFlags::ENCRYPTED));
+                encrypted_msg.set_payload(encrypted_payload.data(), encrypted_payload.size());
+                
+                // 编码加密消息
+                msg_buffer.clear();
+                if (!encrypted_msg.encode(msg_buffer)) {
+                    result.error_message = "Failed to encode encrypted upload message";
+                    LOG_ERROR("%s", result.error_message.c_str());
+                    return result;
+                }
+                
+                LOG_DEBUG("Upload message encrypted successfully");
+            } else {
+                // 不使用加密
+                if (!upload_msg.encode(msg_buffer)) {
+                    result.error_message = "Failed to encode upload message";
+                    LOG_ERROR("%s", result.error_message.c_str());
+                    return result;
+                }
             }
             
             // 发送消息 - 添加重试机制
@@ -802,6 +1028,44 @@ TransferResult ClientCore::upload(const TransferRequest& request) {
                 return result;
             }
             
+            // 检查响应是否加密
+            bool is_encrypted = (response_msg.get_flags() & static_cast<uint8_t>(protocol::ProtocolFlags::ENCRYPTED)) != 0;
+            LOG_DEBUG("Response message flags: 0x%02x, is_encrypted: %d", response_msg.get_flags(), is_encrypted ? 1 : 0);
+            
+            if (is_encrypted && encryption_enabled_ && key_exchange_completed_) {
+                LOG_DEBUG("Response is encrypted, decrypting payload");
+                
+                // 获取负载并解密
+                const std::vector<uint8_t>& encrypted_payload = response_msg.get_payload();
+                std::vector<uint8_t> decrypted_payload = decrypt_data(encrypted_payload);
+                
+                // 创建一个新的消息来解析解密后的负载
+                protocol::Message decrypted_msg(protocol::OperationType::UPLOAD);
+                std::vector<uint8_t> decrypted_buffer(sizeof(protocol::ProtocolHeader) + decrypted_payload.size());
+                
+                // 复制原消息头但移除加密标志
+                protocol::ProtocolHeader decrypted_header = header; // 使用之前读取的header
+                decrypted_header.flags &= ~static_cast<uint8_t>(protocol::ProtocolFlags::ENCRYPTED);
+                std::memcpy(decrypted_buffer.data(), &decrypted_header, sizeof(protocol::ProtocolHeader));
+                
+                // 添加解密后的负载
+                std::memcpy(decrypted_buffer.data() + sizeof(protocol::ProtocolHeader), 
+                           decrypted_payload.data(), decrypted_payload.size());
+                
+                // 解析解密后的消息
+                if (!response_msg.decode(decrypted_buffer)) {
+                    result.error_message = "Failed to decode decrypted server response";
+                    LOG_ERROR("%s", result.error_message.c_str());
+                    return result;
+                }
+                
+                LOG_DEBUG("Response decrypted successfully");
+            } else if (is_encrypted) {
+                LOG_WARNING("Response is encrypted but encryption is not ready");
+                result.error_message = "Received encrypted response but encryption is not enabled";
+                return result;
+            }
+            
             // 检查响应类型
             if (response_msg.get_operation_type() == protocol::OperationType::ERROR) {
                 std::string error_message(
@@ -901,10 +1165,47 @@ TransferResult ClientCore::download(const TransferRequest& request) {
         
         // 编码消息
         std::vector<uint8_t> msg_buffer;
-        if (!download_msg.encode(msg_buffer)) {
-            result.error_message = "Failed to encode download message";
-            LOG_ERROR("%s", result.error_message.c_str());
-            return result;
+        
+        // 如果启用了加密，设置加密标志并加密数据
+        if (encryption_enabled_ && key_exchange_completed_) {
+            // 设置加密标志
+            download_msg.set_encrypted(true);
+            
+            // 编码原始消息
+            if (!download_msg.encode(msg_buffer)) {
+                result.error_message = "Failed to encode download message";
+                LOG_ERROR("%s", result.error_message.c_str());
+                return result;
+            }
+            
+            // 获取负载（跳过协议头）
+            std::vector<uint8_t> payload(msg_buffer.begin() + sizeof(protocol::ProtocolHeader), 
+                                       msg_buffer.end());
+            
+            // 加密负载
+            std::vector<uint8_t> encrypted_payload = encrypt_data(payload);
+            
+            // 创建新的带加密标志的消息
+            protocol::Message encrypted_msg(protocol::OperationType::DOWNLOAD);
+            encrypted_msg.set_flags(static_cast<uint8_t>(protocol::ProtocolFlags::ENCRYPTED));
+            encrypted_msg.set_payload(encrypted_payload.data(), encrypted_payload.size());
+            
+            // 编码加密消息
+            msg_buffer.clear();
+            if (!encrypted_msg.encode(msg_buffer)) {
+                result.error_message = "Failed to encode encrypted download message";
+                LOG_ERROR("%s", result.error_message.c_str());
+                return result;
+            }
+            
+            LOG_DEBUG("Download message encrypted successfully");
+        } else {
+            // 不使用加密
+            if (!download_msg.encode(msg_buffer)) {
+                result.error_message = "Failed to encode download message";
+                LOG_ERROR("%s", result.error_message.c_str());
+                return result;
+            }
         }
         
         // 发送消息
@@ -983,12 +1284,64 @@ TransferResult ClientCore::download(const TransferRequest& request) {
                 return result;
             }
 
-            // 确保消息类型正确
-            if (msg.get_operation_type() != protocol::OperationType::DOWNLOAD) {
-                result.error_message = "Unexpected message type in response";
-                LOG_ERROR("%s: expected %d, got %d", result.error_message.c_str(), 
-                         static_cast<int>(protocol::OperationType::DOWNLOAD), 
-                         static_cast<int>(msg.get_operation_type()));
+            // 检查响应是否加密
+            bool is_encrypted = (msg.get_flags() & static_cast<uint8_t>(protocol::ProtocolFlags::ENCRYPTED)) != 0;
+            LOG_DEBUG("Response message flags: 0x%02x, is_encrypted: %d", msg.get_flags(), is_encrypted ? 1 : 0);
+            
+            if (is_encrypted && encryption_enabled_ && key_exchange_completed_) {
+                LOG_DEBUG("Response is encrypted, decrypting payload");
+                
+                // 获取负载并解密
+                const std::vector<uint8_t>& encrypted_payload = msg.get_payload();
+                LOG_DEBUG("Encrypted payload size: %zu", encrypted_payload.size());
+                
+                std::vector<uint8_t> decrypted_payload = decrypt_data(encrypted_payload);
+                
+                // 提取文件数据
+                size_t metadata_size = sizeof(uint64_t) * 2;
+                size_t file_data_size = decrypted_payload.size() - metadata_size;
+
+                // 解析元数据
+                uint64_t offset_be = 0;
+                uint64_t total_size_be = 0;
+                if (decrypted_payload.size() >= metadata_size) {
+                    std::memcpy(&offset_be, decrypted_payload.data(), sizeof(uint64_t));
+                    std::memcpy(&total_size_be, decrypted_payload.data() + sizeof(uint64_t), sizeof(uint64_t));
+                
+                    // 转换为主机字节序
+                    uint64_t offset = protocol::net_to_host64(offset_be);
+                    uint64_t total_size = protocol::net_to_host64(total_size_be);
+                
+                    LOG_DEBUG("Metadata parsed: offset=%llu, total_size=%llu", offset, total_size);
+                }
+                
+                // 检查文件数据大小是否合理
+                if (file_data_size > 1024 * 1024 * 1024) {  // 超过1GB，很可能是错误的
+                    LOG_ERROR("Unreasonable file_data_size: %zu", file_data_size);
+                    return result;
+                }
+                
+                std::vector<uint8_t> file_data;
+                
+                if (file_data_size > 0) {
+                    file_data.resize(file_data_size);
+                    // 从元数据后面提取文件数据，跳过偏移量和总大小字段
+                    std::memcpy(file_data.data(), decrypted_payload.data() + metadata_size, file_data_size);
+                }
+                
+                // 创建新的下载消息
+                protocol::DownloadMessage download_response;
+                // 设置响应数据，不包含元数据
+                download_response.set_response_data(file_data.data(), file_data.size(), file_data.size(), true);  // 设置LAST_CHUNK标志
+                
+                // 更新原始消息
+                msg = download_response;
+                
+                LOG_DEBUG("Successfully parsed decrypted download message: total_size=%zu, data_size=%zu", 
+                          file_data_size, file_data.size());
+            } else if (is_encrypted) {
+                LOG_WARNING("Response is encrypted but encryption is not ready");
+                result.error_message = "Received encrypted response but encryption is not enabled";
                 return result;
             }
 
@@ -1014,22 +1367,25 @@ TransferResult ClientCore::download(const TransferRequest& request) {
                 
                 // 确保数据写入磁盘
                 file.flush();
+                
+                // 更新进度
+                offset += response_data.size();
+                result.transferred_bytes = offset;
+                
+                // 回调进度
+                if (progress_callback_) {
+                    progress_callback_(result.transferred_bytes, response.get_total_size());
+                }
             } else {
                 LOG_WARNING("Received empty response data chunk");
             }
             
-            // 更新进度
-            offset += response_data.size();
-            result.transferred_bytes = offset;
-            
-            // 回调进度
-            if (progress_callback_) {
-                progress_callback_(result.transferred_bytes, response.get_total_size());
-            }
-            
             // 检查是否为最后一个块
             last_chunk = response.is_last_chunk();
-            result.total_bytes = response.get_total_size();
+            if (last_chunk) {
+                result.total_bytes = response.get_total_size();
+                LOG_DEBUG("Last chunk received, total size: %zu", result.total_bytes);
+            }
             
             LOG_DEBUG("Downloaded chunk, offset: %zu, chunk_size: %zu, total_size: %zu, last_chunk: %d", 
                      offset, response_data.size(), result.total_bytes, last_chunk ? 1 : 0);
@@ -1037,6 +1393,18 @@ TransferResult ClientCore::download(const TransferRequest& request) {
         
         // 关闭文件
         file.close();
+        
+        // 验证文件大小
+        if (fs::exists(request.local_file)) {
+            size_t actual_size = fs::file_size(request.local_file);
+            if (actual_size != result.total_bytes) {
+                result.error_message = "File size mismatch: expected " + 
+                                     std::to_string(result.total_bytes) + 
+                                     " bytes, got " + std::to_string(actual_size) + " bytes";
+                LOG_ERROR("%s", result.error_message.c_str());
+                return result;
+            }
+        }
         
         // 计算耗时
         auto end_time = std::chrono::high_resolution_clock::now();
@@ -1069,6 +1437,22 @@ std::future<TransferResult> ClientCore::download_async(const TransferRequest& re
 
 bool ClientCore::is_connected() const {
     return is_connected_ && socket_ && socket_->is_connected();
+}
+
+std::vector<uint8_t> ClientCore::encrypt_data(const std::vector<uint8_t>& data) {
+    if (!encryption_enabled_ || !key_exchange_completed_ || data.empty()) {
+        return data;
+    }
+    
+    return utils::Encryption::aes_encrypt(data, encryption_key_, encryption_iv_);
+}
+
+std::vector<uint8_t> ClientCore::decrypt_data(const std::vector<uint8_t>& data) {
+    if (!encryption_enabled_ || !key_exchange_completed_ || data.empty()) {
+        return data;
+    }
+    
+    return utils::Encryption::aes_decrypt(data, encryption_key_, encryption_iv_);
 }
 
 } // namespace client

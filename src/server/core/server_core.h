@@ -97,6 +97,27 @@ private:
      */
     bool handle_download(const std::vector<uint8_t>& buffer);
     
+    /**
+     * @brief 处理密钥交换请求
+     * @param buffer 消息缓冲区
+     * @return 是否处理成功
+     */
+    bool handle_key_exchange(const std::vector<uint8_t>& buffer);
+    
+    /**
+     * @brief 加密数据
+     * @param data 待加密数据
+     * @return 加密后的数据
+     */
+    std::vector<uint8_t> encrypt_data(const std::vector<uint8_t>& data);
+    
+    /**
+     * @brief 解密数据
+     * @param data 待解密数据
+     * @return 解密后的数据
+     */
+    std::vector<uint8_t> decrypt_data(const std::vector<uint8_t>& data);
+    
 private:
     static std::atomic<size_t> next_session_id_;
     
@@ -104,6 +125,13 @@ private:
     std::unique_ptr<network::TcpSocket> socket_;
     std::thread thread_;
     std::atomic<bool> running_;
+    
+    // 加密相关
+    bool encryption_enabled_;
+    std::vector<uint8_t> encryption_key_;
+    std::vector<uint8_t> encryption_iv_;
+    std::vector<uint8_t> dh_private_key_;
+    bool key_exchange_completed_;
 };
 
 /**

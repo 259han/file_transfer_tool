@@ -1,15 +1,26 @@
 #pragma once
 
 #include <string>
-#include <memory>
-#include <future>
+#include <vector>
 #include <thread>
 #include <atomic>
+#include <memory>
 #include <functional>
+#include <future>
 #include "../../common/network/socket/tcp_socket.h"
+#include "../../common/utils/crypto/encryption.h"
 #include "../../common/utils/logging/logger.h"
+#include <filesystem>
+
+namespace fs = std::filesystem;
 
 namespace ft {
+
+// 前向声明测试类
+namespace test {
+class TestableClientCore;
+}
+
 namespace client {
 
 /**
@@ -71,6 +82,9 @@ struct ServerInfo {
 class ClientCore {
 public:
     using ProgressCallback = std::function<void(size_t, size_t)>;
+    
+    // 为测试目的添加友元类声明
+    friend class ft::test::TestableClientCore;
     
     /**
      * @brief 构造函数
@@ -175,6 +189,33 @@ public:
      */
     bool send_heartbeat();
     
+    /**
+     * @brief 连接到服务器（便利方法）
+     * @param host 主机名或IP地址
+     * @param port 端口号
+     * @return 是否连接成功
+     */
+    bool connect(const std::string& host, uint16_t port) {
+        ServerInfo server;
+        server.host = host;
+        server.port = port;
+        return connect(server);
+    }
+    
+    /**
+     * @brief 加密数据
+     * @param data 待加密数据
+     * @return 加密后的数据
+     */
+    std::vector<uint8_t> encrypt_data(const std::vector<uint8_t>& data);
+    
+    /**
+     * @brief 解密数据
+     * @param data 待解密数据
+     * @return 解密后的数据
+     */
+    std::vector<uint8_t> decrypt_data(const std::vector<uint8_t>& data);
+    
 private:
     /**
      * @brief 启动心跳线程
@@ -191,6 +232,12 @@ private:
      */
     void heartbeat_loop();
     
+    /**
+     * @brief 执行密钥交换
+     * @return 是否成功
+     */
+    bool perform_key_exchange();
+    
     ServerInfo server_info_;
     std::unique_ptr<network::TcpSocket> socket_;
     ProgressCallback progress_callback_;
@@ -202,6 +249,10 @@ private:
     bool encryption_enabled_;
     std::vector<uint8_t> encryption_key_;
     std::vector<uint8_t> encryption_iv_;
+    
+    // 密钥交换相关
+    std::vector<uint8_t> dh_private_key_;
+    bool key_exchange_completed_;
 };
 
 } // namespace client

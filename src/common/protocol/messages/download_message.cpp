@@ -124,9 +124,11 @@ void DownloadMessage::serialize_response() {
     // 创建负载缓冲区
     std::vector<uint8_t> payload(payload_size);
     
-    // 序列化偏移量和文件总大小
-    std::memcpy(payload.data(), &offset_, sizeof(uint64_t));
-    std::memcpy(payload.data() + sizeof(uint64_t), &total_size_, sizeof(uint64_t));
+    // 序列化偏移量和文件总大小 - 使用网络字节序（大端序）
+    uint64_t offset_be = host_to_net64(offset_);
+    uint64_t total_size_be = host_to_net64(total_size_);
+    std::memcpy(payload.data(), &offset_be, sizeof(uint64_t));
+    std::memcpy(payload.data() + sizeof(uint64_t), &total_size_be, sizeof(uint64_t));
     
     // 添加响应数据
     if (!response_data_.empty()) {
@@ -156,9 +158,15 @@ void DownloadMessage::deserialize() {
         
         // 如果负载大小至少包含偏移量和总大小
         if (payload.size() >= sizeof(uint64_t) * 2) {
-            // 解析偏移量和总大小
-            std::memcpy(&offset_, payload.data(), sizeof(uint64_t));
-            std::memcpy(&total_size_, payload.data() + sizeof(uint64_t), sizeof(uint64_t));
+            // 解析偏移量和总大小 - 从网络字节序（大端序）转换
+            uint64_t offset_be = 0;
+            uint64_t total_size_be = 0;
+            std::memcpy(&offset_be, payload.data(), sizeof(uint64_t));
+            std::memcpy(&total_size_be, payload.data() + sizeof(uint64_t), sizeof(uint64_t));
+            
+            // 转换为主机字节序
+            offset_ = net_to_host64(offset_be);
+            total_size_ = net_to_host64(total_size_be);
             
             // 提取响应数据
             size_t metadata_size = sizeof(uint64_t) * 2;

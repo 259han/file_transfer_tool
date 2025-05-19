@@ -48,3 +48,8 @@ Thumbs.db
 
 # 开发指南
 development_guide.md
+
+tests/
+
+storage/
+

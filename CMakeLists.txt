@@ -12,6 +12,9 @@ add_compile_options(-Wall -Wextra -Wpedantic)
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
 
+# 添加测试选项
+option(BUILD_TESTS "Build test programs" ON)
+
 # 查找外部依赖
 find_package(OpenSSL REQUIRED)
 if(NOT OpenSSL_FOUND)
@@ -27,4 +30,10 @@ find_package(ZLIB REQUIRED)
 find_package(Threads REQUIRED)
 
 # 添加子目录
-add_subdirectory(src) 
+add_subdirectory(src)
+
+# 如果构建测试，添加tests子目录
+if(BUILD_TESTS)
+    message(STATUS "Building tests")
+    add_subdirectory(tests)
+endif() 

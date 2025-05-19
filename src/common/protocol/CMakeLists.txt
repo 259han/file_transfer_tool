@@ -3,6 +3,7 @@ add_library(common_protocol
     core/protocol_header.cpp
     messages/upload_message.cpp
     messages/download_message.cpp
+    messages/key_exchange_message.cpp
     protocol.cpp
 )
 

@@ -1,10 +1,14 @@
 #include "server_core.h"
 #include "../../common/protocol/messages/upload_message.h"
 #include "../../common/protocol/messages/download_message.h"
+#include "../../common/protocol/messages/key_exchange_message.h"
+#include "../../common/utils/crypto/encryption.h"
 #include <filesystem>
 #include <fstream>
 #include <chrono>
 #include <cstring>
+#include <openssl/dh.h>
+#include <openssl/bn.h>
 
 namespace fs = std::filesystem;
 
@@ -19,7 +23,12 @@ ClientSession::ClientSession(std::unique_ptr<network::TcpSocket> socket)
     : session_id_(next_session_id_++),
       socket_(std::move(socket)),
       thread_(),
-      running_(false) {
+      running_(false),
+      encryption_enabled_(false),
+      encryption_key_(),
+      encryption_iv_(),
+      dh_private_key_(),
+      key_exchange_completed_(false) {
     
     // 确保socket有效
     if (socket_ && socket_->is_connected()) {
@@ -317,6 +326,10 @@ void ClientSession::process() {
                         message_handled = handle_download(message_buffer);
                         break;
                     
+                    case protocol::OperationType::KEY_EXCHANGE:
+                        message_handled = handle_key_exchange(message_buffer);
+                        break;
+                    
                     case protocol::OperationType::HEARTBEAT:
                         // 发送心跳响应
                         LOG_DEBUG("Session %zu: Received heartbeat, preparing response", session_id_);
@@ -504,6 +517,28 @@ bool ClientSession::handle_upload(const std::vector<uint8_t>& buffer) {
         LOG_INFO("Session %zu: Decoded message - type: %d, flags: %d", 
                  session_id_, type_value, flags_value);
         
+        // 检查是否需要解密
+        bool is_encrypted = (flags_value & static_cast<uint8_t>(protocol::ProtocolFlags::ENCRYPTED)) != 0;
+        if (is_encrypted && encryption_enabled_ && key_exchange_completed_) {
+            LOG_DEBUG("Session %zu: Message is encrypted, decrypting payload", session_id_);
+            
+            // 获取负载并解密
+            const std::vector<uint8_t>& encrypted_payload = msg.get_payload();
+            std::vector<uint8_t> decrypted_payload = decrypt_data(encrypted_payload);
+            
+            // 更新消息的负载
+            msg.set_payload(decrypted_payload.data(), decrypted_payload.size());
+            
+            // 清除加密标志
+            msg.set_flags(flags_value & ~static_cast<uint8_t>(protocol::ProtocolFlags::ENCRYPTED));
+            
+            LOG_DEBUG("Session %zu: Payload decrypted successfully, size: %zu -> %zu", 
+                      session_id_, encrypted_payload.size(), decrypted_payload.size());
+        } else if (is_encrypted) {
+            LOG_WARNING("Session %zu: Message is encrypted but encryption is not ready", session_id_);
+            return false;
+        }
+        
         protocol::UploadMessage upload_msg(msg);
         
         // 获取文件信息
@@ -517,7 +552,14 @@ bool ClientSession::handle_upload(const std::vector<uint8_t>& buffer) {
         
         // 使用ServerCore中配置的存储路径
         fs::path storage_path = fs::path(ServerCore::get_storage_path());
-        fs::path file_path = storage_path / filename;
+        
+        // 检查文件名是否已经包含存储路径前缀，避免路径重复
+        fs::path file_path;
+        if (filename.find(storage_path.string()) == 0) {
+            file_path = filename;  // 如果已经包含存储路径，直接使用
+        } else {
+            file_path = storage_path / filename;  // 否则组合路径
+        }
         
         LOG_INFO("Session %zu: Using storage path: %s, file path: %s", 
                  session_id_, storage_path.c_str(), file_path.c_str());
@@ -589,33 +631,60 @@ bool ClientSession::handle_upload(const std::vector<uint8_t>& buffer) {
         file.close();
         LOG_INFO("Session %zu: File closed successfully", session_id_);
         
-        // 发送响应
-        protocol::Message response(protocol::OperationType::UPLOAD);
-        response.set_flags(is_last_chunk ? static_cast<uint8_t>(protocol::ProtocolFlags::LAST_CHUNK) : 0);
-
-        std::vector<uint8_t> response_buffer;
-        response.encode(response_buffer);
-
-        LOG_INFO("Session %zu: Sending response, size: %zu bytes", session_id_, response_buffer.size());
-        // 打印响应的前几个字节用于调试
-        if (!response_buffer.empty()) {
-            std::string hex_dump;
-            for (size_t i = 0; i < std::min(response_buffer.size(), size_t(16)); ++i) {
-                char hex[8];
-                snprintf(hex, sizeof(hex), "%02x ", response_buffer[i]);
-                hex_dump += hex;
-            }
-            LOG_DEBUG("Session %zu: Response first bytes: %s", session_id_, hex_dump.c_str());
+        // 修改发送响应的部分，如果启用了加密，则加密响应
+        protocol::Message response_msg(protocol::OperationType::UPLOAD);
+        // 设置最后一块标志
+        uint8_t flags = 0;
+        if (is_last_chunk) {
+            flags |= static_cast<uint8_t>(protocol::ProtocolFlags::LAST_CHUNK);
         }
-
-        try {
-            network::SocketError err = socket_->send_all(response_buffer.data(), response_buffer.size());
-            if (err != network::SocketError::SUCCESS) {
-                LOG_ERROR("Session %zu: Failed to send upload response: %d", session_id_, static_cast<int>(err));
+        response_msg.set_flags(flags);
+        
+        // 已经设置了标志位，不需要再设置
+        
+        // 编码响应消息
+        std::vector<uint8_t> response_buffer;
+        
+        // 如果启用了加密，则加密响应
+        if (encryption_enabled_ && key_exchange_completed_) {
+            // 首先编码不带加密标志的消息
+            if (!response_msg.encode(response_buffer)) {
+                LOG_ERROR("Session %zu: Failed to encode upload response", session_id_);
                 return false;
             }
-        } catch (const std::exception& e) {
-            LOG_ERROR("Session %zu: Exception while sending response: %s", session_id_, e.what());
+            
+            // 获取原始消息数据（跳过头部）
+            std::vector<uint8_t> payload(response_buffer.begin() + sizeof(protocol::ProtocolHeader), 
+                                        response_buffer.end());
+            
+            // 加密负载
+            std::vector<uint8_t> encrypted_payload = encrypt_data(payload);
+            
+            // 创建新的带加密标志的消息
+            protocol::Message encrypted_msg(protocol::OperationType::UPLOAD);
+            encrypted_msg.set_flags(static_cast<uint8_t>(protocol::ProtocolFlags::ENCRYPTED));
+            encrypted_msg.set_payload(encrypted_payload.data(), encrypted_payload.size());
+            
+            // 编码加密消息
+            response_buffer.clear();
+            if (!encrypted_msg.encode(response_buffer)) {
+                LOG_ERROR("Session %zu: Failed to encode encrypted upload response", session_id_);
+                return false;
+            }
+            
+            LOG_DEBUG("Session %zu: Response encrypted successfully", session_id_);
+        } else {
+            // 不使用加密
+            if (!response_msg.encode(response_buffer)) {
+                LOG_ERROR("Session %zu: Failed to encode upload response", session_id_);
+                return false;
+            }
+        }
+        
+        // 发送响应
+        network::SocketError err = socket_->send_all(response_buffer.data(), response_buffer.size());
+        if (err != network::SocketError::SUCCESS) {
+            LOG_ERROR("Session %zu: Failed to send upload response: %d", session_id_, static_cast<int>(err));
             return false;
         }
 
@@ -640,6 +709,30 @@ bool ClientSession::handle_download(const std::vector<uint8_t>& buffer) {
             return false;
         }
         
+        // 检查是否需要解密
+        uint8_t flags_value = msg.get_flags();
+        bool is_encrypted = (flags_value & static_cast<uint8_t>(protocol::ProtocolFlags::ENCRYPTED)) != 0;
+        
+        if (is_encrypted && encryption_enabled_ && key_exchange_completed_) {
+            LOG_DEBUG("Session %zu: Message is encrypted, decrypting payload", session_id_);
+            
+            // 获取负载并解密
+            const std::vector<uint8_t>& encrypted_payload = msg.get_payload();
+            std::vector<uint8_t> decrypted_payload = decrypt_data(encrypted_payload);
+            
+            // 更新消息的负载
+            msg.set_payload(decrypted_payload.data(), decrypted_payload.size());
+            
+            // 清除加密标志
+            msg.set_flags(flags_value & ~static_cast<uint8_t>(protocol::ProtocolFlags::ENCRYPTED));
+            
+            LOG_DEBUG("Session %zu: Payload decrypted successfully, size: %zu -> %zu", 
+                     session_id_, encrypted_payload.size(), decrypted_payload.size());
+        } else if (is_encrypted) {
+            LOG_WARNING("Session %zu: Message is encrypted but encryption is not ready", session_id_);
+            return false;
+        }
+        
         protocol::DownloadMessage download_msg(msg);
         
         // 获取文件信息
@@ -652,7 +745,14 @@ bool ClientSession::handle_download(const std::vector<uint8_t>& buffer) {
         
         // 使用ServerCore中配置的存储路径
         fs::path storage_path = fs::path(ServerCore::get_storage_path());
-        fs::path file_path = storage_path / filename;
+        
+        // 检查文件名是否已经包含存储路径前缀，避免路径重复
+        fs::path file_path;
+        if (filename.find(storage_path.string()) == 0) {
+            file_path = filename;  // 如果已经包含存储路径，直接使用
+        } else {
+            file_path = storage_path / filename;  // 否则组合路径
+        }
         
         LOG_INFO("Session %zu: Using storage path: %s, file path: %s", 
                  session_id_, storage_path.c_str(), file_path.c_str());
@@ -702,13 +802,16 @@ bool ClientSession::handle_download(const std::vector<uint8_t>& buffer) {
         if (file_size == 0 || remaining == 0) {
             LOG_WARNING("Session %zu: File is empty or requested length is 0", session_id_);
             
-            // 创建下载响应消息，空数据但设置文件大小
+            // 创建下载响应消息，空数据
             protocol::DownloadMessage response_msg;
             response_msg.set_response_data(nullptr, 0, file_size, true);
             
             // 编码消息
             std::vector<uint8_t> response_buffer;
-            response_msg.encode(response_buffer);
+            if (!response_msg.encode(response_buffer)) {
+                LOG_ERROR("Session %zu: Failed to encode empty download response", session_id_);
+                return false;
+            }
             
             // 发送响应
             LOG_DEBUG("Session %zu: Sending empty response with file_size=%llu", session_id_, file_size);
@@ -764,18 +867,42 @@ bool ClientSession::handle_download(const std::vector<uint8_t>& buffer) {
             
             // 编码消息
             std::vector<uint8_t> response_buffer;
-            if (!response_msg.encode(response_buffer)) {
-                LOG_ERROR("Session %zu: Failed to encode download response", session_id_);
-                return false;
-            }
             
-            // 验证响应消息是否正确设置了标志位
-            if (is_last_chunk && (response_msg.get_flags() & static_cast<uint8_t>(protocol::ProtocolFlags::LAST_CHUNK)) == 0) {
-                LOG_ERROR("Session %zu: Last chunk flag not set correctly in response", session_id_);
-                response_msg.set_flags(response_msg.get_flags() | static_cast<uint8_t>(protocol::ProtocolFlags::LAST_CHUNK));
-                response_buffer.clear();
+            // 如果启用了加密，则加密响应
+            if (encryption_enabled_ && key_exchange_completed_) {
+                // 首先编码不带加密标志的消息
                 if (!response_msg.encode(response_buffer)) {
-                    LOG_ERROR("Session %zu: Failed to re-encode download response with correct flags", session_id_);
+                    LOG_ERROR("Session %zu: Failed to encode download response", session_id_);
+                    return false;
+                }
+                
+                // 获取原始消息数据（跳过头部）
+                std::vector<uint8_t> payload(response_buffer.begin() + sizeof(protocol::ProtocolHeader), 
+                                           response_buffer.end());
+                
+                // 加密负载
+                std::vector<uint8_t> encrypted_payload = encrypt_data(payload);
+                
+                // 创建新的带加密标志的消息
+                protocol::Message encrypted_msg(protocol::OperationType::DOWNLOAD);
+                encrypted_msg.set_flags(static_cast<uint8_t>(protocol::ProtocolFlags::ENCRYPTED) | 
+                                      (is_last_chunk ? static_cast<uint8_t>(protocol::ProtocolFlags::LAST_CHUNK) : 0));
+                
+                // 直接设置负载，避免再添加元数据
+                encrypted_msg.set_payload(encrypted_payload.data(), encrypted_payload.size());
+                
+                // 编码加密消息
+                response_buffer.clear();
+                if (!encrypted_msg.encode(response_buffer)) {
+                    LOG_ERROR("Session %zu: Failed to encode encrypted download response", session_id_);
+                    return false;
+                }
+                
+                LOG_DEBUG("Session %zu: Response encrypted successfully", session_id_);
+            } else {
+                // 不使用加密
+                if (!response_msg.encode(response_buffer)) {
+                    LOG_ERROR("Session %zu: Failed to encode download response", session_id_);
                     return false;
                 }
             }
@@ -818,6 +945,240 @@ bool ClientSession::handle_download(const std::vector<uint8_t>& buffer) {
         LOG_ERROR("Session %zu: Exception while handling download: %s", session_id_, e.what());
         return false;
     }
+}
+
+bool ClientSession::handle_key_exchange(const std::vector<uint8_t>& buffer) {
+    try {
+        LOG_INFO("Session %zu: Received key exchange message, buffer size: %zu", session_id_, buffer.size());
+        
+        // 解析密钥交换消息
+        protocol::Message msg;
+        if (!msg.decode(buffer)) {
+            LOG_ERROR("Session %zu: Failed to decode key exchange message", session_id_);
+            return false;
+        }
+        
+        protocol::KeyExchangeMessage key_msg(msg);
+        protocol::KeyExchangePhase phase = key_msg.get_exchange_phase();
+        
+        LOG_INFO("Session %zu: Key exchange phase: %d", session_id_, static_cast<int>(phase));
+        
+        if (phase == protocol::KeyExchangePhase::CLIENT_HELLO) {
+            // 获取客户端参数
+            std::vector<uint8_t> client_params = key_msg.get_exchange_params();
+            if (client_params.empty()) {
+                LOG_ERROR("Session %zu: Empty client key exchange params", session_id_);
+                return false;
+            }
+            
+            // 从客户端参数中提取DH参数
+            if (client_params.size() < sizeof(uint32_t)) {
+                LOG_ERROR("Session %zu: Invalid client params format", session_id_);
+                return false;
+            }
+            
+            // 读取p的长度和数据
+            uint32_t p_size = 0;
+            std::memcpy(&p_size, client_params.data(), sizeof(uint32_t));
+            
+            if (client_params.size() < sizeof(uint32_t) + p_size) {
+                LOG_ERROR("Session %zu: Client params too short for p", session_id_);
+                return false;
+            }
+            
+            std::vector<uint8_t> p(client_params.begin() + sizeof(uint32_t), 
+                                   client_params.begin() + sizeof(uint32_t) + p_size);
+            
+            // 读取g的长度和数据
+            size_t g_offset = sizeof(uint32_t) + p_size;
+            if (client_params.size() < g_offset + sizeof(uint32_t)) {
+                LOG_ERROR("Session %zu: Client params too short for g length", session_id_);
+                return false;
+            }
+            
+            uint32_t g_size = 0;
+            std::memcpy(&g_size, client_params.data() + g_offset, sizeof(uint32_t));
+            
+            if (client_params.size() < g_offset + sizeof(uint32_t) + g_size) {
+                LOG_ERROR("Session %zu: Client params too short for g", session_id_);
+                return false;
+            }
+            
+            std::vector<uint8_t> g(client_params.begin() + g_offset + sizeof(uint32_t),
+                                  client_params.begin() + g_offset + sizeof(uint32_t) + g_size);
+            
+            // 读取客户端公钥
+            size_t pub_offset = g_offset + sizeof(uint32_t) + g_size;
+            if (client_params.size() < pub_offset + sizeof(uint32_t)) {
+                LOG_ERROR("Session %zu: Client params too short for public key length", session_id_);
+                return false;
+            }
+            
+            uint32_t pub_size = 0;
+            std::memcpy(&pub_size, client_params.data() + pub_offset, sizeof(uint32_t));
+            
+            if (client_params.size() < pub_offset + sizeof(uint32_t) + pub_size) {
+                LOG_ERROR("Session %zu: Client params too short for public key", session_id_);
+                return false;
+            }
+            
+            std::vector<uint8_t> client_public_key(
+                client_params.begin() + pub_offset + sizeof(uint32_t),
+                client_params.begin() + pub_offset + sizeof(uint32_t) + pub_size);
+            
+            // 构建客户端DH参数
+            utils::DHParams client_dh_params;
+            client_dh_params.p = p;
+            client_dh_params.g = g;
+            client_dh_params.public_key = client_public_key;
+            
+            LOG_INFO("Session %zu: Extracted DH params - p: %zu bytes, g: %zu bytes, client public key: %zu bytes",
+                     session_id_, p.size(), g.size(), client_public_key.size());
+            
+            // 使用客户端参数创建服务器DH密钥对
+            dh_private_key_.clear();
+            
+            // 创建DH上下文
+            DH* dh = DH_new();
+            if (!dh) {
+                LOG_ERROR("Session %zu: Failed to create DH context", session_id_);
+                return false;
+            }
+            
+            // 设置p和g参数
+            BIGNUM* bn_p = BN_bin2bn(p.data(), p.size(), nullptr);
+            BIGNUM* bn_g = BN_bin2bn(g.data(), g.size(), nullptr);
+            
+            if (!bn_p || !bn_g) {
+                LOG_ERROR("Session %zu: Failed to convert p or g to BIGNUM", session_id_);
+                if (bn_p) BN_free(bn_p);
+                if (bn_g) BN_free(bn_g);
+                DH_free(dh);
+                return false;
+            }
+            
+            if (DH_set0_pqg(dh, bn_p, nullptr, bn_g) != 1) {
+                LOG_ERROR("Session %zu: Failed to set DH parameters", session_id_);
+                BN_free(bn_p);
+                BN_free(bn_g);
+                DH_free(dh);
+                return false;
+            }
+            
+            // 生成密钥对
+            if (DH_generate_key(dh) != 1) {
+                LOG_ERROR("Session %zu: Failed to generate DH key pair", session_id_);
+                DH_free(dh);
+                return false;
+            }
+            
+            // 获取私钥和公钥
+            const BIGNUM* priv_key = DH_get0_priv_key(dh);
+            const BIGNUM* pub_key = DH_get0_pub_key(dh);
+            
+            if (!priv_key || !pub_key) {
+                LOG_ERROR("Session %zu: Failed to get DH keys", session_id_);
+                DH_free(dh);
+                return false;
+            }
+            
+            // 将私钥保存到成员变量
+            dh_private_key_.resize(BN_num_bytes(priv_key));
+            BN_bn2bin(priv_key, dh_private_key_.data());
+            
+            // 获取服务器公钥
+            std::vector<uint8_t> server_public_key(BN_num_bytes(pub_key));
+            BN_bn2bin(pub_key, server_public_key.data());
+            
+            // 计算共享密钥
+            std::vector<uint8_t> shared_key = utils::Encryption::compute_dh_shared_key(
+                client_dh_params, dh_private_key_);
+            
+            if (shared_key.empty()) {
+                LOG_ERROR("Session %zu: Failed to compute shared key", session_id_);
+                DH_free(dh);
+                return false;
+            }
+            
+            // 派生AES密钥和IV
+            utils::Encryption::derive_key_and_iv(shared_key, encryption_key_, encryption_iv_);
+            
+            if (encryption_key_.size() != 32 || encryption_iv_.size() != 16) {
+                LOG_ERROR("Session %zu: Invalid derived key or IV size: key=%zu, iv=%zu", 
+                          session_id_, encryption_key_.size(), encryption_iv_.size());
+                DH_free(dh);
+                return false;
+            }
+            
+            // 准备服务器响应
+            protocol::KeyExchangeMessage server_hello(protocol::KeyExchangePhase::SERVER_HELLO);
+            
+            // 序列化服务器公钥
+            std::vector<uint8_t> server_params;
+            uint32_t server_key_size = server_public_key.size();
+            
+            // 写入服务器公钥长度
+            server_params.resize(sizeof(uint32_t));
+            std::memcpy(server_params.data(), &server_key_size, sizeof(uint32_t));
+            
+            // 写入服务器公钥
+            server_params.insert(server_params.end(), 
+                                server_public_key.begin(), 
+                                server_public_key.end());
+            
+            server_hello.set_exchange_params(server_params);
+            
+            // 编码响应消息
+            std::vector<uint8_t> response_buffer;
+            if (!server_hello.encode(response_buffer)) {
+                LOG_ERROR("Session %zu: Failed to encode server hello message", session_id_);
+                DH_free(dh);
+                return false;
+            }
+            
+            // 发送响应
+            network::SocketError err = socket_->send_all(response_buffer.data(), response_buffer.size());
+            if (err != network::SocketError::SUCCESS) {
+                LOG_ERROR("Session %zu: Failed to send server hello: %d", session_id_, static_cast<int>(err));
+                DH_free(dh);
+                return false;
+            }
+            
+            // 清理DH上下文
+            DH_free(dh);
+            
+            // 启用加密
+            encryption_enabled_ = true;
+            key_exchange_completed_ = true;
+            
+            LOG_INFO("Session %zu: Key exchange completed successfully", session_id_);
+            return true;
+        } else {
+            LOG_ERROR("Session %zu: Unexpected key exchange phase: %d", 
+                      session_id_, static_cast<int>(phase));
+            return false;
+        }
+    } catch (const std::exception& e) {
+        LOG_ERROR("Session %zu: Exception during key exchange: %s", session_id_, e.what());
+        return false;
+    }
+}
+
+// 实现加密和解密方法
+std::vector<uint8_t> ClientSession::encrypt_data(const std::vector<uint8_t>& data) {
+    if (!encryption_enabled_ || !key_exchange_completed_ || data.empty()) {
+        return data;
+    }
+    
+    return utils::Encryption::aes_encrypt(data, encryption_key_, encryption_iv_);
+}
+
+std::vector<uint8_t> ClientSession::decrypt_data(const std::vector<uint8_t>& data) {
+    if (!encryption_enabled_ || !key_exchange_completed_ || data.empty()) {
+        return data;
+    }
+    
+    return utils::Encryption::aes_decrypt(data, encryption_key_, encryption_iv_);
 }
 
 // ServerCore实现

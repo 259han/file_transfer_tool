@@ -82,9 +82,11 @@ void UploadMessage::serialize_metadata() {
     std::memcpy(payload.data(), &filename_len, sizeof(uint32_t));
     std::memcpy(payload.data() + sizeof(uint32_t), filename_.data(), filename_.size());
     
-    // 序列化偏移量和总大小
-    std::memcpy(payload.data() + sizeof(uint32_t) + filename_.size(), &offset_, sizeof(uint64_t));
-    std::memcpy(payload.data() + sizeof(uint32_t) + filename_.size() + sizeof(uint64_t), &total_size_, sizeof(uint64_t));
+    // 序列化偏移量和总大小 - 使用网络字节序（大端序）
+    uint64_t offset_be = host_to_net64(offset_);
+    uint64_t total_size_be = host_to_net64(total_size_);
+    std::memcpy(payload.data() + sizeof(uint32_t) + filename_.size(), &offset_be, sizeof(uint64_t));
+    std::memcpy(payload.data() + sizeof(uint32_t) + filename_.size() + sizeof(uint64_t), &total_size_be, sizeof(uint64_t));
     
     // 添加文件数据
     if (!file_data_.empty()) {
@@ -110,9 +112,15 @@ void UploadMessage::deserialize_metadata() {
         std::memcpy(&filename_[0], payload.data() + sizeof(uint32_t), filename_len);
     }
     
-    // 解析偏移量和总大小
-    std::memcpy(&offset_, payload.data() + sizeof(uint32_t) + filename_len, sizeof(uint64_t));
-    std::memcpy(&total_size_, payload.data() + sizeof(uint32_t) + filename_len + sizeof(uint64_t), sizeof(uint64_t));
+    // 解析偏移量和总大小 - 从网络字节序（大端序）转换
+    uint64_t offset_be = 0;
+    uint64_t total_size_be = 0;
+    std::memcpy(&offset_be, payload.data() + sizeof(uint32_t) + filename_len, sizeof(uint64_t));
+    std::memcpy(&total_size_be, payload.data() + sizeof(uint32_t) + filename_len + sizeof(uint64_t), sizeof(uint64_t));
+    
+    // 转换为主机字节序
+    offset_ = net_to_host64(offset_be);
+    total_size_ = net_to_host64(total_size_be);
     
     // 计算元数据大小
     size_t metadata_size = sizeof(uint64_t) * 2 + sizeof(uint32_t) + filename_len;

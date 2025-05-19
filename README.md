@@ -16,7 +16,8 @@
 ### 主要特性
 
 - 支持大文件分块传输
-- 传输过程加密
+- 传输过程加密，使用AES-256-CBC算法
+- 实现Diffie-Hellman密钥交换协议确保密钥安全
 - 断点续传功能
 - 支持并发连接
 - 实时传输进度显示
@@ -116,9 +117,23 @@ make -j$(nproc)
 
 项目遵循模块化设计，各模块职责分明：
 
-- **客户端模块 (src/client/)**: 负责文件上传和下载的客户端实现
-- **服务器模块 (src/server/)**: 处理客户端请求，管理文件存储
-- **公共模块 (src/common/)**: 包含网络协议、加密和工具类
+- **客户端模块 (src/client/)**: 负责文件上传和下载的客户端实现，包含密钥交换的发起
+- **服务器模块 (src/server/)**: 处理客户端请求，管理文件存储，响应密钥交换并保障数据安全
+- **公共模块 (src/common/)**: 包含网络协议、加密和工具类，提供加密算法和密钥交换协议的实现
+
+### 加密实现
+
+- 使用Diffie-Hellman密钥交换协议安全地在客户端和服务器之间生成共享密钥
+- 基于共享密钥派生AES-256-CBC加密密钥和IV
+- 在传输过程中对文件数据进行加密和解密
+- 通过消息标志位识别加密状态，自动处理加密和解密
+
+### 最近更新
+
+- **2023-11-15**: 修复了字节序问题，确保在不同平台之间正确传输文件大小信息
+  - 解决了大文件传输中的数据大小不匹配问题
+  - 实现了上传和下载消息中64位整数的网络字节序转换
+  - 优化了加密传输中的数据处理流程
 
 详细的开发文档请参考 `docs/` 目录和 `development_guide.md` 文件。
 
@@ -147,7 +162,8 @@ This is a high-performance file transfer tool developed in C++17, supporting sec
 ### Main Features
 
 - Support for large file chunked transfer
-- Encrypted transmission
+- Encrypted transmission using AES-256-CBC algorithm
+- Diffie-Hellman key exchange protocol for secure key establishment
 - Resume transfer from breakpoints
 - Support for concurrent connections
 - Real-time transfer progress display
@@ -247,11 +263,25 @@ Or use the provided build script:
 
 The project follows a modular design with clear responsibilities for each module:
 
-- **Client module (src/client/)**: Client implementation for file upload and download
-- **Server module (src/server/)**: Handles client requests and manages file storage
-- **Common module (src/common/)**: Contains network protocols, encryption, and utility classes
+- **Client module (src/client/)**: Client implementation for file upload and download, including initiating key exchange
+- **Server module (src/server/)**: Handling client requests, managing file storage, responding to key exchange and ensuring data security
+- **Common module (src/common/)**: Contains network protocols, encryption, and utility classes, providing encryption algorithms and key exchange protocol implementations
 
-For detailed development documentation, refer to the `docs/` directory and the `development_guide.md` file.
+### Encryption Implementation
+
+- Using Diffie-Hellman key exchange protocol to securely generate shared keys between client and server
+- Deriving AES-256-CBC encryption keys and IVs from the shared key
+- Encrypting and decrypting file data during transmission
+- Identifying encryption status through message flags, automatically handling encryption and decryption
+
+### Recent Updates
+
+- **2023-11-15**: Fixed endianness issues to ensure correct file size information transfer between different platforms
+  - Resolved data size mismatch problems in large file transfers
+  - Implemented network byte order conversion for 64-bit integers in upload and download messages
+  - Optimized data processing workflow in encrypted transmissions
+
+For detailed development documentation, please refer to the `docs/` directory and the `development_guide.md` file.
 
 ## Contributing
 
