@@ -1,5 +1,6 @@
 #include "protocol_header.h"
 #include <openssl/md5.h>
+#include <openssl/evp.h>
 #include <cstring>
 
 namespace ft {
@@ -22,7 +23,21 @@ uint32_t ProtocolHeader::calculate_checksum(const void* data, size_t len) {
     }
     
     unsigned char md5_result[MD5_DIGEST_LENGTH];
-    MD5(static_cast<const unsigned char*>(data), len, md5_result);
+    
+    // 使用 EVP 接口替代直接调用 MD5 函数
+    EVP_MD_CTX *mdctx = EVP_MD_CTX_new();
+    if (!mdctx) {
+        return 0;
+    }
+    
+    if (1 != EVP_DigestInit_ex(mdctx, EVP_md5(), NULL) ||
+        1 != EVP_DigestUpdate(mdctx, data, len) ||
+        1 != EVP_DigestFinal_ex(mdctx, md5_result, NULL)) {
+        EVP_MD_CTX_free(mdctx);
+        return 0;
+    }
+    
+    EVP_MD_CTX_free(mdctx);
     
     // 取MD5的前4个字节作为校验和
     uint32_t checksum = 0;

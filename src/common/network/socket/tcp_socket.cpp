@@ -133,7 +133,8 @@ TcpSocket::TcpSocket(TcpSocket&& other) noexcept
     
     // 添加详细的移动构造函数日志
     fprintf(stderr, "TcpSocket move constructor: Moving fd=%d, connected=%d, remote=%s:%d to new object [%p->%p]\n", 
-            sockfd_, connected_ ? 1 : 0, remote_ip_.c_str(), remote_port_, &other, this);
+            sockfd_, connected_ ? 1 : 0, remote_ip_.c_str(), remote_port_, 
+            static_cast<void*>(&other), static_cast<void*>(this));
     
     // 防止源对象析构时关闭socket
     int old_fd = other.sockfd_;
@@ -165,7 +166,8 @@ TcpSocket& TcpSocket::operator=(TcpSocket&& other) noexcept {
         
         // 添加详细的移动赋值运算符日志
         fprintf(stderr, "TcpSocket move assignment: Changed fd from %d to %d, connected=%d, remote=%s:%d [%p->%p]\n", 
-                old_fd, sockfd_, connected_ ? 1 : 0, remote_ip_.c_str(), remote_port_, &other, this);
+                old_fd, sockfd_, connected_ ? 1 : 0, remote_ip_.c_str(), remote_port_, 
+                static_cast<void*>(&other), static_cast<void*>(this));
         
         // 防止源对象析构时关闭socket
         int old_other_fd = other.sockfd_;

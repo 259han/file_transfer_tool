@@ -214,8 +214,14 @@ void Logger::log(LogLevel level, const char* file, int line, const char* func, c
 template<typename... Args>
 std::string Logger::format_string(const char* format, Args&&... args) {
     char buffer[1024];
-    snprintf(buffer, sizeof(buffer), format, std::forward<Args>(args)...);
-    return std::string(buffer);
+    
+    // 修复：当没有参数时，直接返回格式字符串
+    if constexpr(sizeof...(args) == 0) {
+        return std::string(format);
+    } else {
+        snprintf(buffer, sizeof(buffer), format, std::forward<Args>(args)...);
+        return std::string(buffer);
+    }
 }
 
 } // namespace utils

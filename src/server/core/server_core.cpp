@@ -256,7 +256,6 @@ void ClientSession::process() {
             uint8_t flags_value = header.flags;
             uint32_t length_value = header.length;
             uint32_t checksum_value = header.checksum;
-            uint16_t reserved_value = header.reserved;
             
             // 检查魔数
             if (magic_value != protocol::PROTOCOL_MAGIC) {
