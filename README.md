@@ -28,6 +28,7 @@
 - CMake 3.15+
 - OpenSSL 1.1.1+
 - ZLIB
+- JSONCPP
 - POSIX兼容系统 (Linux, macOS)
 
 ## 构建与安装
@@ -38,19 +39,19 @@
 
 ```bash
 sudo apt-get update
-sudo apt-get install -y build-essential cmake libssl-dev zlib1g-dev
+sudo apt-get install -y build-essential cmake libssl-dev zlib1g-dev libjsoncpp-dev
 ```
 
 #### CentOS/RHEL
 
 ```bash
-sudo yum install -y gcc-c++ cmake openssl-devel zlib-devel
+sudo yum install -y gcc-c++ cmake openssl-devel zlib-devel jsoncpp-devel
 ```
 
 #### macOS
 
 ```bash
-brew install cmake openssl zlib
+brew install cmake openssl zlib jsoncpp
 ```
 
 ### 构建项目
@@ -82,36 +83,59 @@ make -j$(nproc)
 ### 服务器模式
 
 ```bash
-./bin/file_transfer_tool --server --port 8080 --storage ./storage
+./build/bin/file_transfer_server [选项]
 ```
 
+选项:
+- `-p, --port <端口>` - 指定监听端口 (默认: 12345)
+- `-d, --dir <目录>` - 指定存储目录 (默认: ./storage)
+- `-c, --config <文件>` - 指定配置文件
+- `-v, --verbose` - 启用详细日志
+- `--log-level <级别>` - 设置日志级别 (debug, info, warning, error)
+
 ### 客户端模式
+
+客户端支持三种基本命令：upload（上传）、download（下载）和test（测试连接）。
 
 #### 上传文件
 
 ```bash
-./bin/file_transfer_tool --upload --file path/to/file --server 192.168.1.100 --port 8080
+./build/bin/file_transfer_client upload <服务器> <端口> <本地文件> [远程文件名]
 ```
 
 #### 下载文件
 
 ```bash
-./bin/file_transfer_tool --download --file filename --output path/to/save --server 192.168.1.100 --port 8080
+./build/bin/file_transfer_client download <服务器> <端口> <远程文件名> [本地文件]
 ```
+
+#### 测试连接
+
+```bash
+./build/bin/file_transfer_client test <服务器> <端口>
+```
+
+#### 客户端选项
+
+所有客户端命令都支持以下选项：
+- `--log-level <级别>` - 设置日志级别 (debug, info, warning, error)
+- `--no-encrypt` - 禁用加密传输（默认启用加密）
 
 ## 配置选项
 
-| 选项 | 描述 | 默认值 |
-|-------------|-----------------|---------------|
-| --server    | 以服务器模式运行 | - |
-| --port      | 服务器端口 | 8080 |
-| --storage   | 服务器存储目录 | ./storage |
-| --upload    | 上传模式 | - |
-| --download  | 下载模式 | - |
-| --file      | 文件路径/名称 | - |
-| --output    | 下载输出目录 | ./ |
-| --server    | 服务器地址 | 127.0.0.1 |
-| --encrypt   | 启用加密 | false |
+### 服务器配置
+
+| 配置文件选项 | 命令行选项 | 描述 | 默认值 |
+|-------------|-----------------|---------------|------------|
+| bind_address | - | 绑定地址 | 0.0.0.0 |
+| port | -p, --port | 服务器端口 | 12345 |
+| storage_path | -d, --dir | 服务器存储目录 | ./storage |
+| max_connections | - | 最大连接数 | 服务器自动决定 |
+| thread_pool_size | - | 线程池大小 | 服务器自动决定 |
+
+### 客户端配置
+
+客户端通过命令行参数直接配置，不使用配置文件。
 
 ## 开发
 
@@ -129,13 +153,6 @@ make -j$(nproc)
 - 通过消息标志位识别加密状态，自动处理加密和解密
 
 ### 最近更新
-
-- **2025-05-19**: 修复了下载功能中的消息解析问题
-  - 解决了加密下载时，客户端错误地将响应消息解析为请求消息的问题
-  - 增强了消息类型识别逻辑，提高了消息解析的鲁棒性
-  - 改进了DownloadMessage::deserialize方法，更可靠地区分请求和响应消息
-  - 为消息解析添加了更严格的数据验证，包括文件名验证和合理的偏移量检查
-  - 优化了客户端对解密后消息的处理流程，确保数据正确写入文件
 
 - **2023-11-15**: 修复了字节序问题，确保在不同平台之间正确传输文件大小信息
   - 解决了大文件传输中的数据大小不匹配问题
@@ -181,6 +198,7 @@ This is a high-performance file transfer tool developed in C++17, supporting sec
 - CMake 3.15+
 - OpenSSL 1.1.1+
 - ZLIB
+- JSONCPP
 - POSIX compatible system (Linux, macOS)
 
 ## Build and Installation
@@ -191,19 +209,19 @@ This is a high-performance file transfer tool developed in C++17, supporting sec
 
 ```bash
 sudo apt-get update
-sudo apt-get install -y build-essential cmake libssl-dev zlib1g-dev
+sudo apt-get install -y build-essential cmake libssl-dev zlib1g-dev libjsoncpp-dev
 ```
 
 #### CentOS/RHEL
 
 ```bash
-sudo yum install -y gcc-c++ cmake openssl-devel zlib-devel
+sudo yum install -y gcc-c++ cmake openssl-devel zlib-devel jsoncpp-devel
 ```
 
 #### macOS
 
 ```bash
-brew install cmake openssl zlib
+brew install cmake openssl zlib jsoncpp
 ```
 
 ### Build the Project
@@ -235,36 +253,59 @@ Or use the provided build script:
 ### Server Mode
 
 ```bash
-./bin/file_transfer_tool --server --port 8080 --storage ./storage
+./build/bin/file_transfer_server [options]
 ```
 
+Options:
+- `-p, --port <port>` - Specify listening port (default: 12345)
+- `-d, --dir <directory>` - Specify storage directory (default: ./storage)
+- `-c, --config <file>` - Specify configuration file
+- `-v, --verbose` - Enable verbose logging
+- `--log-level <level>` - Set log level (debug, info, warning, error)
+
 ### Client Mode
+
+The client supports three basic commands: upload, download, and test (connection testing).
 
 #### Upload a file
 
 ```bash
-./bin/file_transfer_tool --upload --file path/to/file --server 192.168.1.100 --port 8080
+./build/bin/file_transfer_client upload <server> <port> <local_file> [remote_filename]
 ```
 
 #### Download a file
 
 ```bash
-./bin/file_transfer_tool --download --file filename --output path/to/save --server 192.168.1.100 --port 8080
+./build/bin/file_transfer_client download <server> <port> <remote_filename> [local_file]
 ```
+
+#### Test connection
+
+```bash
+./build/bin/file_transfer_client test <server> <port>
+```
+
+#### Client Options
+
+All client commands support the following options:
+- `--log-level <level>` - Set log level (debug, info, warning, error)
+- `--no-encrypt` - Disable encrypted transfer (enabled by default)
 
 ## Configuration Options
 
-| Option | Description | Default |
-|-------------|-----------------|---------------|
-| --server    | Run in server mode | - |
-| --port      | Server port | 8080 |
-| --storage   | Server storage directory | ./storage |
-| --upload    | Upload mode | - |
-| --download  | Download mode | - |
-| --file      | File path/name | - |
-| --output    | Download output directory | ./ |
-| --server    | Server address | 127.0.0.1 |
-| --encrypt   | Enable encryption | false |
+### Server Configuration
+
+| Config File Option | Command-line Option | Description | Default |
+|-------------|-----------------|---------------|------------|
+| bind_address | - | Binding address | 0.0.0.0 |
+| port | -p, --port | Server port | 12345 |
+| storage_path | -d, --dir | Server storage directory | ./storage |
+| max_connections | - | Maximum connections | Auto-determined by server |
+| thread_pool_size | - | Thread pool size | Auto-determined by server |
+
+### Client Configuration
+
+Client is configured directly through command-line parameters and doesn't use configuration files.
 
 ## Development
 
@@ -283,16 +324,38 @@ The project follows a modular design with clear responsibilities for each module
 
 ### Recent Updates
 
-- **2025-05-19**: Fixed message parsing issues in the download functionality
-  - Resolved a problem where the client incorrectly parsed response messages as request messages during encrypted downloads
-  - Enhanced message type identification logic to improve parsing robustness
-  - Improved the DownloadMessage::deserialize method to more reliably distinguish between request and response messages
-  - Added stricter data validation for message parsing, including filename validation and reasonable offset checks
-  - Optimized client handling of decrypted messages to ensure data is correctly written to files
-
 - **2023-11-15**: Fixed byte order issues to ensure correct transmission of file size information across different platforms
   - Resolved data size mismatch issues in large file transfers
   - Implemented network byte order conversion for 64-bit integers in upload and download messages
   - Optimized data processing flow in encrypted transmissions
 
-For detailed development documentation, please refer to the `
+For detailed development documentation, please refer to the `docs/` directory and the `development_guide.md` file.
+
+## Contributing
+
+Contributions are welcome! You can contribute code, report issues, or suggest new features. Please follow these steps:
+
+1. Fork the project
+2. Create your feature branch (`git checkout -b feature/amazing-feature`)
+3. Commit your changes (`git commit -m 'Add some amazing feature'`)
+4. Push to the branch (`git push origin feature/amazing-feature`)
+5. Create a Pull Request
+
+## License
+
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+
+</div>
+
+<script>
+function switchLanguage(lang) {
+  document.getElementById('zh-cn').style.display = lang === 'zh-cn' ? 'block' : 'none';
+  document.getElementById('en').style.display = lang === 'en' ? 'block' : 'none';
+  document.getElementById('zh-cn-btn').style.fontWeight = lang === 'zh-cn' ? 'bold' : 'normal';
+  document.getElementById('en-btn').style.fontWeight = lang === 'en' ? 'bold' : 'normal';
+}
+// 默认显示中文
+window.onload = function() {
+  switchLanguage('zh-cn');
+};
+</script>
