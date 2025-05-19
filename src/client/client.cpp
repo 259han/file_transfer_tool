@@ -113,11 +113,12 @@ void show_help() {
     std::cout << "    测试与服务器的连接" << std::endl;
     std::cout << "其他选项:" << std::endl;
     std::cout << "  --log-level <level>  设置日志级别 (debug, info, warning, error)" << std::endl;
+    std::cout << "  --no-encrypt         禁用加密传输（默认启用加密）" << std::endl;
 }
 
 // 上传文件
 void upload_file(const std::string& server, uint16_t port, const std::string& local_file, 
-                const std::string& remote_file, utils::LogLevel log_level) {
+                const std::string& remote_file, utils::LogLevel log_level, bool use_encryption) {
     // 创建客户端
     ClientCore client;
     client.initialize(log_level);
@@ -131,6 +132,16 @@ void upload_file(const std::string& server, uint16_t port, const std::string& lo
     if (!client.connect(server_info)) {
         std::cerr << "连接服务器失败!" << std::endl;
         return;
+    }
+    
+    // 启用加密（如果需要）
+    if (use_encryption) {
+        std::cout << "启用加密传输..." << std::endl;
+        if (!client.enable_encryption()) {
+            std::cerr << "警告: 无法启用加密，将使用非加密传输" << std::endl;
+        } else {
+            std::cout << "加密已启用" << std::endl;
+        }
     }
     
     // 创建进度条
@@ -160,6 +171,7 @@ void upload_file(const std::string& server, uint16_t port, const std::string& lo
         std::cout << "  耗时: " << std::fixed << std::setprecision(2) << result.elapsed_seconds << " 秒" << std::endl;
         std::cout << "  速度: " << std::fixed << std::setprecision(2) 
                  << (result.transferred_bytes / 1024.0 / 1024.0) / result.elapsed_seconds << " MB/s" << std::endl;
+        std::cout << "  加密: " << (use_encryption ? "是" : "否") << std::endl;
     } else {
         std::cerr << "上传失败: " << result.error_message << std::endl;
     }
@@ -167,7 +179,7 @@ void upload_file(const std::string& server, uint16_t port, const std::string& lo
 
 // 下载文件
 void download_file(const std::string& server, uint16_t port, const std::string& remote_file, 
-                  const std::string& local_file, utils::LogLevel log_level) {
+                  const std::string& local_file, utils::LogLevel log_level, bool use_encryption) {
     // 创建客户端
     ClientCore client;
     client.initialize(log_level);
@@ -181,6 +193,16 @@ void download_file(const std::string& server, uint16_t port, const std::string& 
     if (!client.connect(server_info)) {
         std::cerr << "连接服务器失败!" << std::endl;
         return;
+    }
+    
+    // 启用加密（如果需要）
+    if (use_encryption) {
+        std::cout << "启用加密传输..." << std::endl;
+        if (!client.enable_encryption()) {
+            std::cerr << "警告: 无法启用加密，将使用非加密传输" << std::endl;
+        } else {
+            std::cout << "加密已启用" << std::endl;
+        }
     }
     
     // 创建进度条
@@ -210,13 +232,14 @@ void download_file(const std::string& server, uint16_t port, const std::string& 
         std::cout << "  耗时: " << std::fixed << std::setprecision(2) << result.elapsed_seconds << " 秒" << std::endl;
         std::cout << "  速度: " << std::fixed << std::setprecision(2) 
                  << (result.transferred_bytes / 1024.0 / 1024.0) / result.elapsed_seconds << " MB/s" << std::endl;
+        std::cout << "  加密: " << (use_encryption ? "是" : "否") << std::endl;
     } else {
         std::cerr << "下载失败: " << result.error_message << std::endl;
     }
 }
 
 // 测试连接
-void test_connection(const std::string& server, uint16_t port, utils::LogLevel log_level) {
+void test_connection(const std::string& server, uint16_t port, utils::LogLevel log_level, bool use_encryption) {
     std::cout << "测试与服务器 " << server << ":" << port << " 的连接..." << std::endl;
     
     // 创建客户端
@@ -236,6 +259,16 @@ void test_connection(const std::string& server, uint16_t port, utils::LogLevel l
     if (!client.connect(server_info)) {
         std::cerr << "连接失败: 无法连接到服务器" << std::endl;
         return;
+    }
+    
+    // 如果需要，启用加密
+    bool encryption_success = false;
+    if (use_encryption) {
+        std::cout << "测试加密..." << std::endl;
+        encryption_success = client.enable_encryption();
+        if (!encryption_success) {
+            std::cerr << "警告: 无法启用加密" << std::endl;
+        }
     }
     
     // 测试心跳
@@ -264,6 +297,7 @@ void test_connection(const std::string& server, uint16_t port, utils::LogLevel l
     std::cout << "  连接耗时: " << std::fixed << std::setprecision(3) << elapsed_seconds << " 秒" << std::endl;
     std::cout << "  心跳: 正常" << std::endl;
     std::cout << "  连接状态: 已连接" << std::endl;
+    std::cout << "  加密: " << (encryption_success ? "已启用" : "未启用") << std::endl;
     
     // 断开连接
     client.disconnect();
@@ -284,8 +318,10 @@ int main(int argc, char* argv[]) {
         return 0;
     }
     
-    // 设置日志级别
+    // 设置日志级别和加密选项（默认启用加密）
     utils::LogLevel log_level = utils::LogLevel::INFO;
+    bool use_encryption = true;  // 默认启用加密
+    
     for (int i = 2; i < argc; ++i) {
         std::string arg = argv[i];
         if (arg == "--log-level" && i + 1 < argc) {
@@ -299,6 +335,8 @@ int main(int argc, char* argv[]) {
             } else if (level == "error") {
                 log_level = utils::LogLevel::ERROR;
             }
+        } else if (arg == "--no-encrypt") {
+            use_encryption = false;  // 禁用加密
         }
     }
     
@@ -317,7 +355,7 @@ int main(int argc, char* argv[]) {
         std::string remote_file = (argc > 5) ? argv[5] : local_file;
         
         // 执行上传
-        upload_file(server, port, local_file, remote_file, log_level);
+        upload_file(server, port, local_file, remote_file, log_level, use_encryption);
         
     } else if (command == "download") {
         // 检查参数数量
@@ -333,7 +371,7 @@ int main(int argc, char* argv[]) {
         std::string local_file = (argc > 5) ? argv[5] : remote_file;
         
         // 执行下载
-        download_file(server, port, remote_file, local_file, log_level);
+        download_file(server, port, remote_file, local_file, log_level, use_encryption);
         
     } else if (command == "test") {
         // 检查参数数量
@@ -347,7 +385,7 @@ int main(int argc, char* argv[]) {
         uint16_t port = static_cast<uint16_t>(std::stoi(argv[3]));
         
         // 执行连接测试
-        test_connection(server, port, log_level);
+        test_connection(server, port, log_level, use_encryption);
         
     } else {
         std::cerr << "未知命令: " << command << std::endl;
