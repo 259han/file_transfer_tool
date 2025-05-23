@@ -147,7 +147,7 @@ The project follows a modular design with clear responsibilities for each module
 
 ### Recent Updates
 
-- **2023-11-15**: Fixed byte order issues to ensure correct transmission of file size information across different platforms
+- **2025-5-19**: Fixed byte order issues to ensure correct transmission of file size information across different platforms
   - Resolved data size mismatch issues in large file transfers
   - Implemented network byte order conversion for 64-bit integers in upload and download messages
   - Optimized data processing flow in encrypted transmissions
