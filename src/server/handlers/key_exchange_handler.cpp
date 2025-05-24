@@ -4,9 +4,10 @@
 #include "../../common/protocol/protocol.h"
 #include "../../common/utils/crypto/encryption.h"
 #include <cstring>
-#include <openssl/dh.h>
+#include <openssl/evp.h>
+#include <openssl/param_build.h>
+#include <openssl/core_names.h>
 #include <openssl/bn.h>
-#include <openssl/engine.h>
 
 namespace ft {
 namespace server {
@@ -108,79 +109,37 @@ bool KeyExchangeHandler::process_client_hello(const protocol::KeyExchangeMessage
         client_params.begin() + pub_offset + sizeof(uint32_t),
         client_params.begin() + pub_offset + sizeof(uint32_t) + pub_size);
     
-    // 构建客户端DH参数
+    LOG_INFO("Session %zu: Extracted DH params - p: %zu bytes, g: %zu bytes, client public key: %zu bytes", 
+             get_session_id(), p.size(), g.size(), client_public_key.size());
+    
+    // 使用与客户端相同的方法生成服务器DH密钥对
+    // 直接使用命名组生成，确保兼容性
+    std::vector<uint8_t> server_private_key;
+    utils::DHParams server_dh_params = utils::Encryption::generate_dh_params(server_private_key);
+    
+    if (server_private_key.empty() || server_dh_params.public_key.empty()) {
+        LOG_ERROR("Session %zu: Failed to generate server DH key pair", get_session_id());
+        return false;
+    }
+    
+    LOG_INFO("Session %zu: Generated server DH key pair successfully", get_session_id());
+    
+    // 构建客户端DH参数结构（使用客户端发送的参数）
     utils::DHParams client_dh_params;
     client_dh_params.p = p;
     client_dh_params.g = g;
     client_dh_params.public_key = client_public_key;
     
-    LOG_INFO("Session %zu: Extracted DH params - p: %zu bytes, g: %zu bytes, client public key: %zu bytes",
-             get_session_id(), p.size(), g.size(), client_public_key.size());
-    
-    // 使用客户端参数创建服务器DH密钥对
-    std::vector<uint8_t> dh_private_key;
-    
-    // 创建DH上下文
-    DH* dh = DH_new();
-    if (!dh) {
-        LOG_ERROR("Session %zu: Failed to create DH context", get_session_id());
-        return false;
-    }
-    
-    // 设置p和g参数
-    BIGNUM* bn_p = BN_bin2bn(p.data(), p.size(), nullptr);
-    BIGNUM* bn_g = BN_bin2bn(g.data(), g.size(), nullptr);
-    
-    if (!bn_p || !bn_g) {
-        LOG_ERROR("Session %zu: Failed to convert p or g to BIGNUM", get_session_id());
-        if (bn_p) BN_free(bn_p);
-        if (bn_g) BN_free(bn_g);
-        DH_free(dh);
-        return false;
-    }
-    
-    if (DH_set0_pqg(dh, bn_p, nullptr, bn_g) != 1) {
-        LOG_ERROR("Session %zu: Failed to set DH parameters", get_session_id());
-        BN_free(bn_p);
-        BN_free(bn_g);
-        DH_free(dh);
-        return false;
-    }
-    
-    // 生成密钥对
-    if (DH_generate_key(dh) != 1) {
-        LOG_ERROR("Session %zu: Failed to generate DH key pair", get_session_id());
-        DH_free(dh);
-        return false;
-    }
-    
-    // 获取私钥和公钥
-    const BIGNUM* priv_key = DH_get0_priv_key(dh);
-    const BIGNUM* pub_key = DH_get0_pub_key(dh);
-    
-    if (!priv_key || !pub_key) {
-        LOG_ERROR("Session %zu: Failed to get DH keys", get_session_id());
-        DH_free(dh);
-        return false;
-    }
-    
-    // 将私钥保存到临时变量
-    dh_private_key.resize(BN_num_bytes(priv_key));
-    BN_bn2bin(priv_key, dh_private_key.data());
-    
-    // 获取服务器公钥
-    std::vector<uint8_t> server_public_key(BN_num_bytes(pub_key));
-    BN_bn2bin(pub_key, server_public_key.data());
-    
     // 计算共享密钥
     std::vector<uint8_t> shared_key = utils::Encryption::compute_dh_shared_key(
-        client_dh_params, dh_private_key);
+        client_dh_params, server_private_key);
     
     if (shared_key.empty()) {
         LOG_ERROR("Session %zu: Failed to compute shared key", get_session_id());
-        DH_free(dh);
         return false;
     }
+    
+    LOG_INFO("Session %zu: Computed shared key successfully", get_session_id());
     
     // 派生AES密钥和IV
     std::vector<uint8_t> encryption_key, encryption_iv;
@@ -189,21 +148,16 @@ bool KeyExchangeHandler::process_client_hello(const protocol::KeyExchangeMessage
     if (encryption_key.size() != 32 || encryption_iv.size() != 16) {
         LOG_ERROR("Session %zu: Invalid derived key or IV size: key=%zu, iv=%zu", 
                   get_session_id(), encryption_key.size(), encryption_iv.size());
-        DH_free(dh);
         return false;
     }
     
-    // 发送服务器Hello响应
-    if (!send_server_hello(server_public_key)) {
-        DH_free(dh);
+    // 发送服务器Hello响应（发送服务器的公钥）
+    if (!send_server_hello(server_dh_params.public_key)) {
         return false;
     }
     
     // 设置加密参数到会话
-    set_encryption_keys(encryption_key, encryption_iv, dh_private_key);
-    
-    // 清理DH上下文
-    DH_free(dh);
+    set_encryption_keys(encryption_key, encryption_iv, server_private_key);
     
     LOG_INFO("Session %zu: Key exchange completed successfully", get_session_id());
     return true;

@@ -318,7 +318,7 @@ void ClientSession::process() {
     LOG_INFO("Session %zu: Processing thread exiting", session_id_);
 }
 
-bool ClientSession::handle_heartbeat_response(const std::vector<uint8_t>& buffer) {
+bool ClientSession::handle_heartbeat_response(const std::vector<uint8_t>& /*buffer*/) {
     // 发送心跳响应
     LOG_DEBUG("Session %zu: Received heartbeat, preparing response", session_id_);
     

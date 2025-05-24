@@ -13,11 +13,11 @@ namespace ft {
 namespace server {
 
 ServerCore::ServerCore() 
-    : running_(false),
-      config_(),
+    : config_(),
       listen_socket_(nullptr),
       accept_thread_(),
-      session_manager_thread_() {
+      session_manager_thread_(),
+      running_(false) {
 }
 
 ServerCore::~ServerCore() {

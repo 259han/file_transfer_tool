@@ -138,7 +138,6 @@ bool DownloadHandler::download(ft::network::TcpSocket& socket) {
     
     // 接收响应
     std::vector<uint8_t> resp_buffer(1024 * 4); // 初始缓冲区大小
-    size_t received = 0;
     
     // 添加接收重试逻辑
     int retry_count = 0;
@@ -164,7 +163,6 @@ bool DownloadHandler::download(ft::network::TcpSocket& socket) {
             // 保存header字段到局部变量，避免packed结构体直接访问问题
             uint32_t magic_value = header.magic;
             uint8_t type_value = header.type;
-            uint8_t flags_value = header.flags;
             uint32_t length_value = header.length;
 
             // 验证魔数
@@ -182,8 +180,8 @@ bool DownloadHandler::download(ft::network::TcpSocket& socket) {
                 continue;
             }
             
-            LOG_DEBUG("接收到协议头: 类型=%u, 标志=%u, 长度=%u", 
-                     type_value, flags_value, length_value);
+            LOG_DEBUG("接收到协议头: 类型=%u, 长度=%u", 
+                     type_value, length_value);
             
             // 确保缓冲区足够大
             size_t total_size = sizeof(protocol::ProtocolHeader) + length_value;
@@ -376,7 +374,6 @@ bool DownloadHandler::download(ft::network::TcpSocket& socket) {
         
         // 接收响应
         resp_buffer.resize(sizeof(protocol::ProtocolHeader) + current_chunk_size + 1024);
-        received = 0;
         retry_count = 0;
         recv_success = false;
         
@@ -391,7 +388,6 @@ bool DownloadHandler::download(ft::network::TcpSocket& socket) {
                 // 保存header字段到局部变量，避免packed结构体直接访问问题
                 uint32_t magic_value = header.magic;
                 uint8_t type_value = header.type;
-                uint8_t flags_value = header.flags;
                 uint32_t length_value = header.length;
 
                 // 验证魔数
@@ -418,8 +414,8 @@ bool DownloadHandler::download(ft::network::TcpSocket& socket) {
                     continue;
                 }
                 
-                LOG_DEBUG("接收到协议头: 类型=%u, 标志=%u, 长度=%u", 
-                         type_value, flags_value, length_value);
+                LOG_DEBUG("接收到协议头: 类型=%u, 长度=%u", 
+                         type_value, length_value);
                 
                 // 确保缓冲区足够大
                 size_t total_size = sizeof(protocol::ProtocolHeader) + length_value;
@@ -465,7 +461,6 @@ bool DownloadHandler::download(ft::network::TcpSocket& socket) {
         // 保存header字段到局部变量，避免packed结构体直接访问问题
         uint32_t magic_value = header.magic;
         uint8_t type_value = header.type;
-        uint8_t flags_value = header.flags;
         uint32_t length_value = header.length;
         
         // 验证魔数

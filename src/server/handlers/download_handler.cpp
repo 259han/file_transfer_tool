@@ -139,8 +139,6 @@ bool DownloadHandler::process_download_request(const protocol::DownloadMessage& 
 }
 
 bool DownloadHandler::send_file_data(const std::string& file_path, uint64_t offset, uint64_t length) {
-    FileLockManager& lock_manager = FileLockManager::instance();
-    
     // 获取文件大小
     uint64_t file_size = fs::file_size(file_path);
     LOG_DEBUG("Session %zu: File size: %llu bytes", get_session_id(), file_size);

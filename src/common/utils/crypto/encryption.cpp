@@ -4,7 +4,8 @@
 #include <openssl/evp.h>
 #include <openssl/rand.h>
 #include <openssl/aes.h>
-#include <openssl/dh.h>
+#include <openssl/param_build.h>
+#include <openssl/core_names.h>
 #include <openssl/bn.h>
 #include <openssl/kdf.h>
 #include <sstream>
@@ -15,116 +16,82 @@
 namespace ft {
 namespace utils {
 
-// 使用预先计算的DH参数，避免每次生成大素数带来的性能开销
-// OpenSSL提供的预定义DH参数组（这些数值是实际使用的DH参数的十六进制表示）
-// 使用2048位参数
-static const unsigned char rfc3526_prime_2048[] = {
-    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xC9, 0x0F, 0xDA, 0xA2, 
-    0x21, 0x68, 0xC2, 0x34, 0xC4, 0xC6, 0x62, 0x8B, 0x80, 0xDC, 0x1C, 0xD1,
-    0x29, 0x02, 0x4E, 0x08, 0x8A, 0x67, 0xCC, 0x74, 0x02, 0x0B, 0xBE, 0xA6, 
-    0x3B, 0x13, 0x9B, 0x22, 0x51, 0x4A, 0x08, 0x79, 0x8E, 0x34, 0x04, 0xDD,
-    0xEF, 0x95, 0x19, 0xB3, 0xCD, 0x3A, 0x43, 0x1B, 0x30, 0x2B, 0x0A, 0x6D, 
-    0xF2, 0x5F, 0x14, 0x37, 0x4F, 0xE1, 0x35, 0x6D, 0x6D, 0x51, 0xC2, 0x45,
-    0xE4, 0x85, 0xB5, 0x76, 0x62, 0x5E, 0x7E, 0xC6, 0xF4, 0x4C, 0x42, 0xE9, 
-    0xA6, 0x37, 0xED, 0x6B, 0x0B, 0xFF, 0x5C, 0xB6, 0xF4, 0x06, 0xB7, 0xED,
-    0xEE, 0x38, 0x6B, 0xFB, 0x5A, 0x89, 0x9F, 0xA5, 0xAE, 0x9F, 0x24, 0x11, 
-    0x7C, 0x4B, 0x1F, 0xE6, 0x49, 0x28, 0x66, 0x51, 0xEC, 0xE4, 0x5B, 0x3D,
-    0xC2, 0x00, 0x7C, 0xB8, 0xA1, 0x63, 0xBF, 0x05, 0x98, 0xDA, 0x48, 0x36, 
-    0x1C, 0x55, 0xD3, 0x9A, 0x69, 0x16, 0x3F, 0xA8, 0xFD, 0x24, 0xCF, 0x5F,
-    0x83, 0x65, 0x5D, 0x23, 0xDC, 0xA3, 0xAD, 0x96, 0x1C, 0x62, 0xF3, 0x56, 
-    0x20, 0x85, 0x52, 0xBB, 0x9E, 0xD5, 0x29, 0x07, 0x70, 0x96, 0x96, 0x6D,
-    0x67, 0x0C, 0x35, 0x4E, 0x4A, 0xBC, 0x98, 0x04, 0xF1, 0x74, 0x6C, 0x08, 
-    0xCA, 0x18, 0x21, 0x7C, 0x32, 0x90, 0x5E, 0x46, 0x2E, 0x36, 0xCE, 0x3B,
-    0xE3, 0x9E, 0x77, 0x2C, 0x18, 0x0E, 0x86, 0x03, 0x9B, 0x27, 0x83, 0xA2, 
-    0xEC, 0x07, 0xA2, 0x8F, 0xB5, 0xC5, 0x5D, 0xF0, 0x6F, 0x4C, 0x52, 0xC9,
-    0xDE, 0x2B, 0xCB, 0xF6, 0x95, 0x58, 0x17, 0x18, 0x39, 0x95, 0x49, 0x7C, 
-    0xEA, 0x95, 0x6A, 0xE5, 0x15, 0xD2, 0x26, 0x18, 0x98, 0xFA, 0x05, 0x10,
-    0x15, 0x72, 0x8E, 0x5A, 0x8A, 0xAA, 0xC4, 0x2D, 0xAD, 0x33, 0x17, 0x0D, 
-    0x04, 0x50, 0x7A, 0x33, 0xA8, 0x55, 0x21, 0xAB, 0xDF, 0x1C, 0xBA, 0x64,
-    0xEC, 0xFB, 0x85, 0x04, 0x58, 0xDB, 0xEF, 0x0A, 0x8A, 0xEA, 0x71, 0x57, 
-    0x5D, 0x06, 0x0C, 0x7D, 0xB3, 0x97, 0x0F, 0x85, 0xA6, 0xE1, 0xE4, 0xC7,
-    0xAB, 0xF5, 0xAE, 0x8C, 0xDB, 0x09, 0x33, 0xD7, 0x1E, 0x8C, 0x94, 0xE0, 
-    0x4A, 0x25, 0x61, 0x9D, 0xCE, 0xE3, 0xD2, 0x26, 0x1A, 0xD2, 0xEE, 0x6B,
-    0xF1, 0x2F, 0xFA, 0x06, 0xD9, 0x8A, 0x08, 0x64, 0xD8, 0x76, 0x02, 0x73,
-    0x3E, 0xC8, 0x6A, 0x64, 0x52, 0x1F, 0x2B, 0x18, 0x17, 0x7B, 0x20, 0x0C,
-    0xBB, 0xE1, 0x17, 0x57, 0x7A, 0x61, 0x5D, 0x6C, 0x77, 0x09, 0x88, 0xC0,
-    0xBA, 0xD9, 0x46, 0xE2, 0x08, 0xE2, 0x4F, 0xA0, 0x74, 0xE5, 0xAB, 0x31,
-    0x43, 0xDB, 0x5B, 0xFC, 0xE0, 0xFD, 0x10, 0x8E, 0x4B, 0x82, 0xD1, 0x20,
-    0xA9, 0x3A, 0xD2, 0xCA, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF
-};
-
-// 2是标准生成元
-static const unsigned char generator[] = { 0x02 };
-
 /**
- * @brief 使用预定义的DH参数创建密钥对
+ * @brief 使用新的EVP API和RFC 7919命名组创建DH密钥对
+ * 
+ * 使用OpenSSL 3.0的EVP API和预定义的安全组"ffdhe2048"来生成DH密钥对。
+ * 这种方法避免了使用已废弃的DH_*函数，并且使用了标准化的安全参数。
+ * 
  * @param private_key [输出] 私钥
- * @return DH参数
+ * @return DH参数结构体，包含p、g和公钥
  */
 static DHParams create_dh_params_from_predefined(std::vector<uint8_t>& private_key) {
     DHParams params;
     
-    // 使用预定义的DH参数创建密钥对
-    DH* dh = DH_new();
-    if (!dh) {
-        return params;
-    }
+    // 使用EVP_PKEY_CTX创建DH密钥对
+    EVP_PKEY_CTX* pctx = nullptr;
+    EVP_PKEY* pkey = nullptr;
     
-    // 设置预定义的参数
-    BIGNUM* p = BN_bin2bn(rfc3526_prime_2048, sizeof(rfc3526_prime_2048), nullptr);
-    BIGNUM* g = BN_bin2bn(generator, sizeof(generator), nullptr);
+    do {
+        // 创建DH密钥生成上下文
+        pctx = EVP_PKEY_CTX_new_from_name(nullptr, "DH", nullptr);
+        if (!pctx) break;
+        
+        // 初始化密钥生成
+        if (EVP_PKEY_keygen_init(pctx) <= 0) break;
+        
+        // 使用预定义的安全组 ffdhe2048 (RFC 7919)
+        OSSL_PARAM param_array[2];
+        param_array[0] = OSSL_PARAM_construct_utf8_string("group", (char*)"ffdhe2048", 0);
+        param_array[1] = OSSL_PARAM_construct_end();
+        
+        // 设置DH参数
+        if (EVP_PKEY_CTX_set_params(pctx, param_array) <= 0) break;
+        
+        // 生成密钥对
+        if (EVP_PKEY_generate(pctx, &pkey) <= 0) break;
+        
+        // 获取生成的密钥参数
+        BIGNUM* p_bn = nullptr;
+        BIGNUM* g_bn = nullptr;
+        BIGNUM* priv_bn = nullptr;
+        BIGNUM* pub_bn = nullptr;
+        
+        if (!EVP_PKEY_get_bn_param(pkey, OSSL_PKEY_PARAM_FFC_P, &p_bn) ||
+            !EVP_PKEY_get_bn_param(pkey, OSSL_PKEY_PARAM_FFC_G, &g_bn) ||
+            !EVP_PKEY_get_bn_param(pkey, OSSL_PKEY_PARAM_PRIV_KEY, &priv_bn) ||
+            !EVP_PKEY_get_bn_param(pkey, OSSL_PKEY_PARAM_PUB_KEY, &pub_bn)) {
+            if (p_bn) BN_free(p_bn);
+            if (g_bn) BN_free(g_bn);
+            if (priv_bn) BN_free(priv_bn);
+            if (pub_bn) BN_free(pub_bn);
+            break;
+        }
+        
+        // 将密钥转换为字节数组
+        params.p.resize(BN_num_bytes(p_bn));
+        BN_bn2bin(p_bn, params.p.data());
+        
+        params.g.resize(BN_num_bytes(g_bn));
+        BN_bn2bin(g_bn, params.g.data());
+        
+        params.public_key.resize(BN_num_bytes(pub_bn));
+        BN_bn2bin(pub_bn, params.public_key.data());
+        
+        private_key.resize(BN_num_bytes(priv_bn));
+        BN_bn2bin(priv_bn, private_key.data());
+        
+        // 清理BIGNUM
+        BN_free(p_bn);
+        BN_free(g_bn);
+        BN_free(priv_bn);
+        BN_free(pub_bn);
+        
+    } while (false);
     
-    if (!p || !g) {
-        if (p) BN_free(p);
-        if (g) BN_free(g);
-        DH_free(dh);
-        return params;
-    }
-    
-    // 设置DH参数
-    if (DH_set0_pqg(dh, p, nullptr, g) != 1) {
-        BN_free(p);
-        BN_free(g);
-        DH_free(dh);
-        return params;
-    }
-    
-    // 生成密钥对
-    if (DH_generate_key(dh) != 1) {
-        DH_free(dh);
-        return params;
-    }
-    
-    // 获取DH参数
-    const BIGNUM* out_p = nullptr;
-    const BIGNUM* out_g = nullptr;
-    const BIGNUM* pub_key = nullptr;
-    const BIGNUM* priv_key = nullptr;
-    
-    // 使用DH_get0_*函数获取参数
-    DH_get0_pqg(dh, &out_p, nullptr, &out_g);
-    DH_get0_key(dh, &pub_key, &priv_key);
-    
-    if (!out_p || !out_g || !pub_key || !priv_key) {
-        DH_free(dh);
-        return params;
-    }
-    
-    // 转换为字节数组
-    params.p.resize(BN_num_bytes(out_p));
-    BN_bn2bin(out_p, params.p.data());
-    
-    params.g.resize(BN_num_bytes(out_g));
-    BN_bn2bin(out_g, params.g.data());
-    
-    params.public_key.resize(BN_num_bytes(pub_key));
-    BN_bn2bin(pub_key, params.public_key.data());
-    
-    private_key.resize(BN_num_bytes(priv_key));
-    BN_bn2bin(priv_key, private_key.data());
-    
-    // 清理
-    DH_free(dh);
+    // 清理资源
+    if (pctx) EVP_PKEY_CTX_free(pctx);
+    if (pkey) EVP_PKEY_free(pkey);
     
     return params;
 }
@@ -133,32 +100,6 @@ static DHParams create_dh_params_from_predefined(std::vector<uint8_t>& private_k
 DHParams Encryption::generate_dh_params(std::vector<uint8_t>& private_key) {
     // 使用预定义参数更快速地创建密钥对，而不是每次生成新的DH参数
     return create_dh_params_from_predefined(private_key);
-    
-    /* 原始动态生成DH参数的代码保留在注释中，以备需要
-    DHParams params;
-    
-    // 创建DH上下文
-    DH* dh = DH_new();
-    if (!dh) {
-        return params;
-    }
-    
-    // 使用2048位参数
-    if (DH_generate_parameters_ex(dh, 2048, DH_GENERATOR_2, nullptr) != 1) {
-        DH_free(dh);
-        return params;
-    }
-    
-    // 生成密钥对
-    if (DH_generate_key(dh) != 1) {
-        DH_free(dh);
-        return params;
-    }
-    
-    ... 其余代码保持不变 ...
-    
-    return params;
-    */
 }
 
 std::string Encryption::md5(const void* data, size_t len) {
@@ -459,70 +400,166 @@ std::vector<uint8_t> Encryption::compute_dh_shared_key(const DHParams& params,
                                                      const std::vector<uint8_t>& private_key) {
     std::vector<uint8_t> shared_key;
     
-    // 创建DH上下文
-    DH* dh = DH_new();
-    if (!dh) {
-        return shared_key;
-    }
+    // 使用EVP API进行DH密钥交换
+    EVP_PKEY_CTX* pctx = nullptr;
+    EVP_PKEY* pkey = nullptr;
+    EVP_PKEY* peer_key = nullptr;
+    OSSL_PARAM_BLD* param_bld = nullptr;
+    OSSL_PARAM* param = nullptr;
+    OSSL_PARAM_BLD* peer_param_bld = nullptr;
+    OSSL_PARAM* peer_param = nullptr;
     
-    // 设置参数
-    BIGNUM* p = BN_bin2bn(params.p.data(), params.p.size(), nullptr);
-    BIGNUM* g = BN_bin2bn(params.g.data(), params.g.size(), nullptr);
-    BIGNUM* priv = BN_bin2bn(private_key.data(), private_key.size(), nullptr);
+    do {
+        // 创建本地密钥的参数构建器
+        param_bld = OSSL_PARAM_BLD_new();
+        if (!param_bld) break;
+        
+        // 设置DH参数
+        BIGNUM* p_bn = BN_bin2bn(params.p.data(), params.p.size(), nullptr);
+        BIGNUM* g_bn = BN_bin2bn(params.g.data(), params.g.size(), nullptr);
+        BIGNUM* priv_bn = BN_bin2bn(private_key.data(), private_key.size(), nullptr);
+        
+        if (!p_bn || !g_bn || !priv_bn) {
+            if (p_bn) BN_free(p_bn);
+            if (g_bn) BN_free(g_bn);
+            if (priv_bn) BN_free(priv_bn);
+            break;
+        }
+        
+        if (!OSSL_PARAM_BLD_push_BN(param_bld, OSSL_PKEY_PARAM_FFC_P, p_bn) ||
+            !OSSL_PARAM_BLD_push_BN(param_bld, OSSL_PKEY_PARAM_FFC_G, g_bn) ||
+            !OSSL_PARAM_BLD_push_BN(param_bld, OSSL_PKEY_PARAM_PRIV_KEY, priv_bn)) {
+            BN_free(p_bn);
+            BN_free(g_bn);
+            BN_free(priv_bn);
+            break;
+        }
+        
+        // 构建本地密钥参数
+        param = OSSL_PARAM_BLD_to_param(param_bld);
+        if (!param) {
+            BN_free(p_bn);
+            BN_free(g_bn);
+            BN_free(priv_bn);
+            break;
+        }
+        
+        // 创建本地密钥
+        EVP_PKEY_CTX* key_ctx = EVP_PKEY_CTX_new_from_name(nullptr, "DH", nullptr);
+        if (!key_ctx) {
+            BN_free(p_bn);
+            BN_free(g_bn);
+            BN_free(priv_bn);
+            break;
+        }
+        
+        if (EVP_PKEY_fromdata_init(key_ctx) <= 0 ||
+            EVP_PKEY_fromdata(key_ctx, &pkey, EVP_PKEY_KEYPAIR, param) <= 0) {
+            EVP_PKEY_CTX_free(key_ctx);
+            BN_free(p_bn);
+            BN_free(g_bn);
+            BN_free(priv_bn);
+            break;
+        }
+        EVP_PKEY_CTX_free(key_ctx);
+        
+        // 创建对方公钥的参数构建器
+        peer_param_bld = OSSL_PARAM_BLD_new();
+        if (!peer_param_bld) {
+            BN_free(p_bn);
+            BN_free(g_bn);
+            BN_free(priv_bn);
+            break;
+        }
+        
+        BIGNUM* peer_pub_bn = BN_bin2bn(params.public_key.data(), params.public_key.size(), nullptr);
+        if (!peer_pub_bn) {
+            BN_free(p_bn);
+            BN_free(g_bn);
+            BN_free(priv_bn);
+            break;
+        }
+        
+        if (!OSSL_PARAM_BLD_push_BN(peer_param_bld, OSSL_PKEY_PARAM_FFC_P, p_bn) ||
+            !OSSL_PARAM_BLD_push_BN(peer_param_bld, OSSL_PKEY_PARAM_FFC_G, g_bn) ||
+            !OSSL_PARAM_BLD_push_BN(peer_param_bld, OSSL_PKEY_PARAM_PUB_KEY, peer_pub_bn)) {
+            BN_free(p_bn);
+            BN_free(g_bn);
+            BN_free(priv_bn);
+            BN_free(peer_pub_bn);
+            break;
+        }
+        
+        // 构建对方公钥参数
+        peer_param = OSSL_PARAM_BLD_to_param(peer_param_bld);
+        if (!peer_param) {
+            BN_free(p_bn);
+            BN_free(g_bn);
+            BN_free(priv_bn);
+            BN_free(peer_pub_bn);
+            break;
+        }
+        
+        // 创建对方公钥
+        EVP_PKEY_CTX* peer_key_ctx = EVP_PKEY_CTX_new_from_name(nullptr, "DH", nullptr);
+        if (!peer_key_ctx) {
+            BN_free(p_bn);
+            BN_free(g_bn);
+            BN_free(priv_bn);
+            BN_free(peer_pub_bn);
+            break;
+        }
+        
+        if (EVP_PKEY_fromdata_init(peer_key_ctx) <= 0 ||
+            EVP_PKEY_fromdata(peer_key_ctx, &peer_key, EVP_PKEY_PUBLIC_KEY, peer_param) <= 0) {
+            EVP_PKEY_CTX_free(peer_key_ctx);
+            BN_free(p_bn);
+            BN_free(g_bn);
+            BN_free(priv_bn);
+            BN_free(peer_pub_bn);
+            break;
+        }
+        EVP_PKEY_CTX_free(peer_key_ctx);
+        
+        // 清理BIGNUM
+        BN_free(p_bn);
+        BN_free(g_bn);
+        BN_free(priv_bn);
+        BN_free(peer_pub_bn);
+        
+        // 创建密钥交换上下文
+        pctx = EVP_PKEY_CTX_new(pkey, nullptr);
+        if (!pctx) break;
+        
+        // 初始化密钥交换
+        if (EVP_PKEY_derive_init(pctx) <= 0) break;
+        
+        // 设置对方公钥
+        if (EVP_PKEY_derive_set_peer(pctx, peer_key) <= 0) break;
+        
+        // 获取共享密钥长度
+        size_t shared_key_len = 0;
+        if (EVP_PKEY_derive(pctx, nullptr, &shared_key_len) <= 0) break;
+        
+        // 计算共享密钥
+        shared_key.resize(shared_key_len);
+        if (EVP_PKEY_derive(pctx, shared_key.data(), &shared_key_len) <= 0) {
+            shared_key.clear();
+            break;
+        }
+        
+        shared_key.resize(shared_key_len);
+        
+    } while (false);
     
-    if (!p || !g || !priv) {
-        if (p) BN_free(p);
-        if (g) BN_free(g);
-        if (priv) BN_free(priv);
-        DH_free(dh);
-        return shared_key;
-    }
-    
-    // 设置DH参数
-    if (DH_set0_pqg(dh, p, nullptr, g) != 1) {
-        BN_free(p);
-        BN_free(g);
-        BN_free(priv);
-        DH_free(dh);
-        return shared_key;
-    }
-    
-    // 设置私钥
-    BIGNUM* pub = BN_new();
-    if (!pub) {
-        BN_free(priv);
-        DH_free(dh);
-        return shared_key;
-    }
-    
-    if (DH_set0_key(dh, pub, priv) != 1) {
-        BN_free(pub);
-        BN_free(priv);
-        DH_free(dh);
-        return shared_key;
-    }
-    
-    // 转换对方公钥
-    BIGNUM* peer_pub_key = BN_bin2bn(params.public_key.data(), 
-                                     params.public_key.size(), nullptr);
-    if (!peer_pub_key) {
-        DH_free(dh);
-        return shared_key;
-    }
-    
-    // 计算共享密钥
-    shared_key.resize(DH_size(dh));
-    int key_size = DH_compute_key(shared_key.data(), peer_pub_key, dh);
-    
-    if (key_size <= 0) {
-        shared_key.clear();
-    } else {
-        shared_key.resize(key_size);
-    }
-    
-    // 清理
-    BN_free(peer_pub_key);
-    DH_free(dh);
+    // 清理资源
+    if (peer_param) OSSL_PARAM_free(peer_param);
+    if (peer_param_bld) OSSL_PARAM_BLD_free(peer_param_bld);
+    if (param) OSSL_PARAM_free(param);
+    if (param_bld) OSSL_PARAM_BLD_free(param_bld);
+    if (pctx) EVP_PKEY_CTX_free(pctx);
+    if (pkey) EVP_PKEY_free(pkey);
+    if (peer_key) EVP_PKEY_free(peer_key);
     
     return shared_key;
 }
