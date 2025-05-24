@@ -3,6 +3,7 @@ add_library(client_core
     core/client_core.cpp
     handlers/upload_handler.cpp
     handlers/download_handler.cpp
+    handlers/authentication_handler.cpp
     utils/progress_tracker.cpp
 )
 

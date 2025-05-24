@@ -22,6 +22,22 @@ bool DownloadHandler::handle(const std::vector<uint8_t>& buffer) {
         // 添加额外调试信息
         LOG_INFO("Session %zu: Received download message, buffer size: %zu", get_session_id(), buffer.size());
         
+        // 检查用户权限
+        if (!session_.is_authenticated()) {
+            LOG_WARNING("Session %zu: Download denied - user not authenticated", get_session_id());
+            return send_error_response("Authentication required for download operations");
+        }
+        
+        // 检查读权限 (READ = 0x01)
+        if (!session_.has_permission(0x01)) {
+            LOG_WARNING("Session %zu: Download denied - user '%s' lacks read permission", 
+                       get_session_id(), session_.get_authenticated_username().c_str());
+            return send_error_response("Insufficient permissions for download operations");
+        }
+        
+        LOG_DEBUG("Session %zu: User '%s' authorized for download", 
+                 get_session_id(), session_.get_authenticated_username().c_str());
+        
         // 解析下载消息
         protocol::Message msg;
         if (!msg.decode(buffer)) {

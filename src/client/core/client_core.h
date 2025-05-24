@@ -23,6 +23,10 @@ class TestableClientCore;
 
 namespace client {
 
+// 前向声明
+class ClientAuthenticationHandler;
+struct AuthenticationResult;
+
 /**
  * @brief 传输请求结构体
  */
@@ -190,6 +194,46 @@ public:
     bool send_heartbeat();
     
     /**
+     * @brief 认证用户
+     * @param username 用户名
+     * @param password 密码
+     * @return 认证结果
+     */
+    AuthenticationResult authenticate(const std::string& username, const std::string& password);
+    
+    /**
+     * @brief 使用API密钥认证
+     * @param api_key API密钥
+     * @return 认证结果
+     */
+    AuthenticationResult authenticate_with_api_key(const std::string& api_key);
+    
+    /**
+     * @brief 检查是否已认证
+     * @return 是否已认证
+     */
+    bool is_authenticated() const;
+    
+    /**
+     * @brief 获取认证用户名
+     * @return 用户名
+     */
+    const std::string& get_authenticated_username() const;
+    
+    /**
+     * @brief 获取用户权限
+     * @return 权限位掩码
+     */
+    uint8_t get_user_permissions() const;
+    
+    /**
+     * @brief 检查是否有指定权限
+     * @param permission 权限类型
+     * @return 是否有权限
+     */
+    bool has_permission(uint8_t permission) const;
+    
+    /**
      * @brief 连接到服务器（便利方法）
      * @param host 主机名或IP地址
      * @param port 端口号
@@ -253,6 +297,12 @@ private:
     // 密钥交换相关
     std::vector<uint8_t> dh_private_key_;
     bool key_exchange_completed_;
+    
+    // 认证相关
+    bool authenticated_;
+    std::string authenticated_username_;
+    uint8_t user_permissions_;
+    std::unique_ptr<ClientAuthenticationHandler> auth_handler_;
 };
 
 } // namespace client

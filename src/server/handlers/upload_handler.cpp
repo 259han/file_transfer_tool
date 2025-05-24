@@ -21,6 +21,22 @@ bool UploadHandler::handle(const std::vector<uint8_t>& buffer) {
     try {
         LOG_DEBUG("Session %zu: Processing upload message", get_session_id());
         
+        // 检查用户权限
+        if (!session_.is_authenticated()) {
+            LOG_WARNING("Session %zu: Upload denied - user not authenticated", get_session_id());
+            return send_error_response("Authentication required for upload operations");
+        }
+        
+        // 检查写权限 (WRITE = 0x02)
+        if (!session_.has_permission(0x02)) {
+            LOG_WARNING("Session %zu: Upload denied - user '%s' lacks write permission", 
+                       get_session_id(), session_.get_authenticated_username().c_str());
+            return send_error_response("Insufficient permissions for upload operations");
+        }
+        
+        LOG_DEBUG("Session %zu: User '%s' authorized for upload", 
+                 get_session_id(), session_.get_authenticated_username().c_str());
+        
         // 解析消息
         protocol::Message msg;
         if (!msg.decode(buffer)) {

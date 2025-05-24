@@ -20,6 +20,7 @@ enum class OperationType : uint8_t {
     DOWNLOAD = 0x02,     // 下载操作
     HEARTBEAT = 0x03,    // 心跳包
     KEY_EXCHANGE = 0x04, // 密钥交换
+    AUTHENTICATION = 0x05, // 身份认证
     ERROR = 0xFF         // 错误响应
 };
 

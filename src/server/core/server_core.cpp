@@ -2,6 +2,7 @@
 #include "client_session.h"
 #include "../session/session_manager.h"
 #include "../../common/utils/logging/logger.h"
+#include "../../common/utils/auth/user_manager.h"
 #include <filesystem>
 #include <iostream>
 #include <thread>
@@ -44,6 +45,28 @@ bool ServerCore::initialize(const ServerConfig& config, utils::LogLevel log_leve
         }
     } catch (const std::exception& e) {
         LOG_ERROR("Exception while creating storage directory: %s", e.what());
+        return false;
+    }
+    
+    // 初始化用户管理器
+    std::string users_file = "data/auth/users.json";
+    std::string api_keys_file = "data/auth/api_keys.json";
+    
+    // 确保认证数据目录存在
+    try {
+        if (!fs::exists("data/auth")) {
+            if (!fs::create_directories("data/auth")) {
+                LOG_ERROR("Failed to create auth data directory: data/auth");
+                return false;
+            }
+        }
+    } catch (const std::exception& e) {
+        LOG_ERROR("Exception while creating auth data directory: %s", e.what());
+        return false;
+    }
+    
+    if (!utils::UserManager::instance().initialize(users_file, api_keys_file)) {
+        LOG_ERROR("Failed to initialize UserManager");
         return false;
     }
     

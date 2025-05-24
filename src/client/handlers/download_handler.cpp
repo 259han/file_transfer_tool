@@ -218,6 +218,29 @@ bool DownloadHandler::download(ft::network::TcpSocket& socket) {
     }
     
     // 解析响应消息
+    LOG_DEBUG("准备解析响应消息，缓冲区大小: %zu", resp_buffer.size());
+    
+    // 打印协议头信息用于调试
+    if (resp_buffer.size() >= sizeof(protocol::ProtocolHeader)) {
+        protocol::ProtocolHeader* debug_header = reinterpret_cast<protocol::ProtocolHeader*>(resp_buffer.data());
+        
+        // 使用局部变量避免packed结构体访问问题
+        uint32_t magic_val = debug_header->magic;
+        uint8_t type_val = debug_header->type;
+        uint8_t flags_val = debug_header->flags;
+        uint32_t length_val = debug_header->length;
+        
+        LOG_DEBUG("协议头: magic=0x%08x, type=%u, flags=%u, length=%u", 
+                 magic_val, type_val, flags_val, length_val);
+                 
+        // 确保缓冲区大小精确匹配
+        size_t expected_size = sizeof(protocol::ProtocolHeader) + length_val;
+        if (resp_buffer.size() != expected_size) {
+            LOG_WARNING("调整缓冲区大小: 从 %zu 到 %zu", resp_buffer.size(), expected_size);
+            resp_buffer.resize(expected_size);
+        }
+    }
+    
     protocol::Message resp_msg;
     if (!resp_msg.decode(resp_buffer)) {
         LOG_ERROR("解析响应消息失败");

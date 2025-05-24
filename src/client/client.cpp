@@ -1,4 +1,5 @@
 #include "core/client_core.h"
+#include "handlers/authentication_handler.h"
 #include "../common/protocol/protocol.h"
 #include "../common/protocol/messages/upload_message.h"
 #include "../common/protocol/messages/download_message.h"
@@ -144,6 +145,24 @@ void upload_file(const std::string& server, uint16_t port, const std::string& lo
         }
     }
     
+    // 进行用户认证
+    std::cout << "请输入认证信息:" << std::endl;
+    std::string username, password;
+    std::cout << "用户名: ";
+    std::cin >> username;
+    std::cout << "密码: ";
+    std::cin >> password;
+    
+    std::cout << "正在认证..." << std::endl;
+    AuthenticationResult auth_result = client.authenticate(username, password);
+    if (!auth_result.success) {
+        std::cerr << "认证失败: " << auth_result.error_message << std::endl;
+        return;
+    }
+    
+    std::cout << "认证成功! 用户: " << auth_result.username 
+              << ", 权限: " << static_cast<int>(auth_result.permissions) << std::endl;
+    
     // 创建进度条
     ProgressBar progress_bar;
     client.set_progress_callback([&progress_bar](size_t current, size_t total) {
@@ -204,6 +223,24 @@ void download_file(const std::string& server, uint16_t port, const std::string& 
             std::cout << "加密已启用" << std::endl;
         }
     }
+    
+    // 进行用户认证
+    std::cout << "请输入认证信息:" << std::endl;
+    std::string username, password;
+    std::cout << "用户名: ";
+    std::cin >> username;
+    std::cout << "密码: ";
+    std::cin >> password;
+    
+    std::cout << "正在认证..." << std::endl;
+    AuthenticationResult auth_result = client.authenticate(username, password);
+    if (!auth_result.success) {
+        std::cerr << "认证失败: " << auth_result.error_message << std::endl;
+        return;
+    }
+    
+    std::cout << "认证成功! 用户: " << auth_result.username 
+              << ", 权限: " << static_cast<int>(auth_result.permissions) << std::endl;
     
     // 创建进度条
     ProgressBar progress_bar;

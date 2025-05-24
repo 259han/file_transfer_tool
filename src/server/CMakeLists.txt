@@ -8,6 +8,7 @@ add_library(server_core
     handlers/upload_handler.cpp
     handlers/download_handler.cpp
     handlers/key_exchange_handler.cpp
+    handlers/authentication_handler.cpp
     session/session_manager.cpp
 )
 

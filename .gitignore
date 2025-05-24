@@ -34,27 +34,27 @@ server_log.txt
 tmp/
 temp/
 
-# 测试文件
+# 测试文件和数据
 tests/tmp/
 test_file.dat
+*.dat
+test_*.txt
+*_test.txt
+*_downloaded.txt
 
-# 存储目录
-storage/
+# 运行时数据目录（保留结构但忽略内容）
+storage/*
+!storage/.gitkeep
+data/auth/*.json
+data/auth/*.key
 
 # 操作系统相关
 .DS_Store
-Thumbs.db 
+Thumbs.db
 
-# 开发指南
+# 开发相关
 development_guide.md
-
-tests/
-
-storage/
-
 read.md
-
-*.dat
 
 .gitignore
 

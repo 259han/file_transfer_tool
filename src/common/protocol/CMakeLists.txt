@@ -4,6 +4,7 @@ add_library(common_protocol
     messages/upload_message.cpp
     messages/download_message.cpp
     messages/key_exchange_message.cpp
+    messages/authentication_message.cpp
     protocol.cpp
 )
 

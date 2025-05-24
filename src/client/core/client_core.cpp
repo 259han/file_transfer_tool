@@ -1,7 +1,10 @@
 #include "client_core.h"
 #include "../handlers/upload_handler.h"
 #include "../handlers/download_handler.h"
+#include "../handlers/authentication_handler.h"
+#include "../../common/protocol/protocol.h"
 #include "../../common/protocol/messages/key_exchange_message.h"
+#include "../../common/protocol/messages/authentication_message.h"
 #include "../../common/utils/crypto/encryption.h"
 #include <chrono>
 #include <fstream>
@@ -26,7 +29,11 @@ ClientCore::ClientCore()
       encryption_key_(),
       encryption_iv_(),
       dh_private_key_(),
-      key_exchange_completed_(false) {
+      key_exchange_completed_(false),
+      authenticated_(false),
+      authenticated_username_(),
+      user_permissions_(0),
+      auth_handler_(std::make_unique<ClientAuthenticationHandler>()) {
 }
 
 ClientCore::~ClientCore() {
@@ -590,6 +597,14 @@ void ClientCore::disconnect() {
     stop_heartbeat_ = true;
     is_connected_ = false;
     
+    // 清除认证状态
+    authenticated_ = false;
+    authenticated_username_.clear();
+    user_permissions_ = 0;
+    if (auth_handler_) {
+        auth_handler_->clear_authentication();
+    }
+    
     // 关闭套接字
     if (socket_) {
         socket_->close();
@@ -949,6 +964,79 @@ std::vector<uint8_t> ClientCore::decrypt_data(const std::vector<uint8_t>& data) 
         LOG_WARNING("Using exception fallback handler. This is for debugging only!");
         return data;
     }
+}
+
+AuthenticationResult ClientCore::authenticate(const std::string& username, const std::string& password) {
+    if (!is_connected_ || !socket_) {
+        AuthenticationResult result;
+        result.error_message = "Not connected to server";
+        return result;
+    }
+    
+    LOG_INFO("Authenticating user: %s", username.c_str());
+    
+    AuthenticationResult result = auth_handler_->authenticate_user(*socket_, username, password);
+    
+    if (result.success) {
+        // 同步状态到ClientCore
+        authenticated_ = true;
+        authenticated_username_ = result.username;
+        user_permissions_ = result.permissions;
+        
+        LOG_INFO("User %s authenticated successfully in ClientCore", username.c_str());
+    } else {
+        // 清除状态
+        authenticated_ = false;
+        authenticated_username_.clear();
+        user_permissions_ = 0;
+    }
+    
+    return result;
+}
+
+AuthenticationResult ClientCore::authenticate_with_api_key(const std::string& api_key) {
+    if (!is_connected_ || !socket_) {
+        AuthenticationResult result;
+        result.error_message = "Not connected to server";
+        return result;
+    }
+    
+    LOG_INFO("Authenticating with API key");
+    
+    AuthenticationResult result = auth_handler_->authenticate_api_key(*socket_, api_key);
+    
+    if (result.success) {
+        // 同步状态到ClientCore
+        authenticated_ = true;
+        authenticated_username_ = result.username;
+        user_permissions_ = result.permissions;
+        
+        LOG_INFO("API key authenticated successfully for user %s in ClientCore", 
+                 authenticated_username_.c_str());
+    } else {
+        // 清除状态
+        authenticated_ = false;
+        authenticated_username_.clear();
+        user_permissions_ = 0;
+    }
+    
+    return result;
+}
+
+bool ClientCore::is_authenticated() const {
+    return authenticated_ && auth_handler_ && auth_handler_->is_authenticated();
+}
+
+const std::string& ClientCore::get_authenticated_username() const {
+    return authenticated_username_;
+}
+
+uint8_t ClientCore::get_user_permissions() const {
+    return user_permissions_;
+}
+
+bool ClientCore::has_permission(uint8_t permission) const {
+    return authenticated_ && (user_permissions_ & permission) != 0;
 }
 
 } // namespace client

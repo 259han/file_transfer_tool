@@ -15,6 +15,7 @@ This is a high-performance file transfer tool developed in C++17, supporting sec
 - Support for concurrent connections
 - Real-time transfer progress display
 - **OpenSSL 3.0+ Compatible** - Uses modern EVP APIs, avoiding deprecated function warnings
+- **User Management System** - Support multi-user authentication, permission control and API key management
 
 ## Requirements
 
@@ -222,6 +223,14 @@ The project uses modern OpenSSL 3.0 APIs to implement secure file transfer:
 - **Performance Optimization**: DH parameter generation time optimized from seconds to milliseconds
 
 ### Recent Updates
+
+- **2025-01-26**: **User Management System**
+  - Added complete user authentication system with username/password authentication
+  - Implemented 4-level permission control system (Read, Write, Delete, Admin)
+  - Added API key support providing dual authentication mechanism
+  - Included user management CLI tool supporting user CRUD operations, key generation and authentication testing
+  - Password encrypted storage with SHA-256 + random salt for account security
+  - User data stored in `data/auth/` directory with permission isolation
 
 - **2025-5-24**: **OpenSSL 3.0 API Migration**
   - Migrated all DH-related functions from deprecated `DH_*` APIs to modern EVP APIs

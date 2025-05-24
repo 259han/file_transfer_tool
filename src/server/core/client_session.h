@@ -16,6 +16,7 @@ namespace server {
 class UploadHandler;
 class DownloadHandler;
 class KeyExchangeHandler;
+class AuthenticationHandler;
 
 /**
  * @brief 客户端会话类
@@ -107,6 +108,50 @@ public:
      * @brief 启用加密
      */
     void enable_encryption();
+    
+    /**
+     * @brief 检查是否已认证
+     * @return 是否已认证
+     */
+    bool is_authenticated() const;
+    
+    /**
+     * @brief 设置认证状态
+     * @param session_id 认证会话ID
+     * @param username 用户名
+     * @param permissions 用户权限
+     */
+    void set_authenticated(const std::string& session_id, const std::string& username, uint8_t permissions);
+    
+    /**
+     * @brief 清除认证状态
+     */
+    void clear_authentication();
+    
+    /**
+     * @brief 获取认证会话ID
+     * @return 会话ID
+     */
+    const std::string& get_auth_session_id() const;
+    
+    /**
+     * @brief 获取认证用户名
+     * @return 用户名
+     */
+    const std::string& get_authenticated_username() const;
+    
+    /**
+     * @brief 获取用户权限
+     * @return 权限位掩码
+     */
+    uint8_t get_user_permissions() const;
+    
+    /**
+     * @brief 检查是否有指定权限
+     * @param permission 权限类型
+     * @return 是否有权限
+     */
+    bool has_permission(uint8_t permission) const;
 
 private:
     /**
@@ -120,6 +165,13 @@ private:
      * @return 是否处理成功
      */
     bool handle_heartbeat_response(const std::vector<uint8_t>& buffer);
+    
+    /**
+     * @brief 处理认证请求
+     * @param buffer 消息缓冲区
+     * @return 是否处理成功
+     */
+    bool handle_authentication_request(const std::vector<uint8_t>& buffer);
 
 private:
     static std::atomic<size_t> next_session_id_;
@@ -136,10 +188,17 @@ private:
     std::vector<uint8_t> dh_private_key_;
     bool key_exchange_completed_;
     
+    // 认证相关
+    bool authenticated_;
+    std::string auth_session_id_;
+    std::string authenticated_username_;
+    uint8_t user_permissions_;
+    
     // 协议处理器
     std::unique_ptr<UploadHandler> upload_handler_;
     std::unique_ptr<DownloadHandler> download_handler_;
     std::unique_ptr<KeyExchangeHandler> key_exchange_handler_;
+    std::unique_ptr<AuthenticationHandler> authentication_handler_;
 };
 
 } // namespace server

@@ -3,6 +3,7 @@ add_library(common_utils
     logging/logger.cpp
     config/config_manager.cpp
     crypto/encryption.cpp
+    auth/user_manager.cpp
 )
 
 # 设置包含目录

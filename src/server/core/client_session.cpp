@@ -2,11 +2,13 @@
 #include "../handlers/upload_handler.h"
 #include "../handlers/download_handler.h"
 #include "../handlers/key_exchange_handler.h"
+#include "../handlers/authentication_handler.h"
 #include "../../common/protocol/protocol.h"
 #include "../../common/utils/crypto/encryption.h"
 #include <thread>
 #include <chrono>
 #include <cstring>
+#include <ctime>
 
 namespace ft {
 namespace server {
@@ -23,7 +25,11 @@ ClientSession::ClientSession(std::unique_ptr<network::TcpSocket> socket)
       encryption_key_(),
       encryption_iv_(),
       dh_private_key_(),
-      key_exchange_completed_(false) {
+      key_exchange_completed_(false),
+      authenticated_(false),
+      auth_session_id_(),
+      authenticated_username_(),
+      user_permissions_(0) {
     
     // 确保socket有效
     if (socket_ && socket_->is_connected()) {
@@ -46,6 +52,7 @@ ClientSession::ClientSession(std::unique_ptr<network::TcpSocket> socket)
     upload_handler_ = std::make_unique<UploadHandler>(*this);
     download_handler_ = std::make_unique<DownloadHandler>(*this);
     key_exchange_handler_ = std::make_unique<KeyExchangeHandler>(*this);
+    authentication_handler_ = std::make_unique<AuthenticationHandler>();
 }
 
 ClientSession::~ClientSession() {
@@ -298,6 +305,10 @@ void ClientSession::process() {
                 handled = key_exchange_handler_->handle(full_message);
                 break;
                 
+            case protocol::OperationType::AUTHENTICATION:
+                handled = handle_authentication_request(full_message);
+                break;
+                
             case protocol::OperationType::HEARTBEAT:
                 handled = handle_heartbeat_response(full_message);
                 break;
@@ -357,6 +368,90 @@ bool ClientSession::handle_heartbeat_response(const std::vector<uint8_t>& /*buff
                  session_id_, e.what());
         return false;
     }
+}
+
+bool ClientSession::handle_authentication_request(const std::vector<uint8_t>& buffer) {
+    LOG_DEBUG("Session %zu: Received authentication request", session_id_);
+    
+    try {
+        // 直接解析认证消息，避免重复解码
+        protocol::AuthenticationMessage auth_msg(protocol::AuthenticationPhase::AUTH_REQUEST);
+        if (!auth_msg.decode(buffer)) {
+            LOG_ERROR("Session %zu: Failed to decode authentication message", session_id_);
+            return false;
+        }
+        
+        LOG_DEBUG("Session %zu: Authentication request - phase: %d, type: %d", 
+                 session_id_, 
+                 static_cast<int>(auth_msg.get_auth_phase()),
+                 static_cast<int>(auth_msg.get_auth_type()));
+        
+        // 使用认证处理器处理请求
+        // 注意：AuthenticationHandler需要shared_ptr<TcpSocket>，这里需要适配
+        std::shared_ptr<network::TcpSocket> socket_ptr(socket_.get(), [](network::TcpSocket*){});
+        bool result = authentication_handler_->handle_authentication_request(socket_ptr, auth_msg);
+        
+        if (result) {
+            LOG_INFO("Session %zu: Authentication request handled successfully", session_id_);
+            
+            // 如果认证处理器成功处理了请求，说明认证成功，更新会话状态
+            // 从认证处理器获取会话信息
+            std::string session_id_str = auth_msg.get_username() + "_" + std::to_string(std::time(nullptr));
+            
+            // 获取用户权限
+            uint8_t permissions = utils::UserManager::instance().get_user_permissions(auth_msg.get_username());
+            
+            set_authenticated(session_id_str, auth_msg.get_username(), permissions);
+        } else {
+            LOG_WARNING("Session %zu: Authentication request handling failed", session_id_);
+        }
+        
+        return result;
+        
+    } catch (const std::exception& e) {
+        LOG_ERROR("Session %zu: Exception while handling authentication request: %s", 
+                 session_id_, e.what());
+        return false;
+    }
+}
+
+bool ClientSession::is_authenticated() const {
+    return authenticated_;
+}
+
+void ClientSession::set_authenticated(const std::string& session_id, const std::string& username, uint8_t permissions) {
+    authenticated_ = true;
+    auth_session_id_ = session_id;
+    authenticated_username_ = username;
+    user_permissions_ = permissions;
+    
+    LOG_INFO("Session %zu: User '%s' authenticated with permissions %d", 
+             session_id_, username.c_str(), permissions);
+}
+
+void ClientSession::clear_authentication() {
+    authenticated_ = false;
+    auth_session_id_.clear();
+    authenticated_username_.clear();
+    user_permissions_ = 0;
+    
+    LOG_INFO("Session %zu: Authentication cleared", session_id_);
+}
+
+const std::string& ClientSession::get_auth_session_id() const {
+    return auth_session_id_;
+}
+
+const std::string& ClientSession::get_authenticated_username() const {
+    return authenticated_username_;
+}
+
+uint8_t ClientSession::get_user_permissions() const {
+    return user_permissions_;
+}
+
+bool ClientSession::has_permission(uint8_t permission) const {
+    return authenticated_ && (user_permissions_ & permission) != 0;
 }
 
 } // namespace server
