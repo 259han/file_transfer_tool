@@ -1,10 +1,13 @@
 # 添加服务器核心库
 add_library(server_core
     core/server_core.cpp
-    handlers/connection_handler.cpp
-    handlers/file_handler.cpp
+    core/client_session.cpp
     handlers/file_lock_manager.cpp
     handlers/file_version.cpp
+    handlers/protocol_handler.cpp
+    handlers/upload_handler.cpp
+    handlers/download_handler.cpp
+    handlers/key_exchange_handler.cpp
     session/session_manager.cpp
 )
 

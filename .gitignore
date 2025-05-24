@@ -39,8 +39,7 @@ tests/tmp/
 test_file.dat
 
 # 存储目录
-storage/*
-!storage/.gitkeep
+storage/
 
 # 操作系统相关
 .DS_Store
@@ -54,4 +53,8 @@ tests/
 storage/
 
 read.md
+
+*.dat
+
+.gitignore
 

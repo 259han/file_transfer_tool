@@ -10,6 +10,7 @@
 #include <unordered_map>
 #include "../../common/network/socket/tcp_socket.h"
 #include "../../common/utils/logging/logger.h"
+#include "client_session.h"
 
 namespace ft {
 namespace server {
@@ -31,114 +32,6 @@ struct ServerConfig {
           max_connections(100),
           thread_pool_size(4) {
     }
-};
-
-/**
- * @brief 客户端会话类
- */
-class ClientSession {
-public:
-    /**
-     * @brief 构造函数
-     * @param socket 客户端socket
-     */
-    explicit ClientSession(std::unique_ptr<network::TcpSocket> socket);
-    
-    /**
-     * @brief 析构函数
-     */
-    ~ClientSession();
-    
-    /**
-     * @brief 启动会话处理
-     */
-    void start();
-    
-    /**
-     * @brief 停止会话处理
-     */
-    void stop();
-    
-    /**
-     * @brief 获取客户端地址
-     * @return 客户端地址
-     */
-    std::string get_client_address() const;
-    
-    /**
-     * @brief 获取会话ID
-     * @return 会话ID
-     */
-    size_t get_session_id() const;
-    
-    /**
-     * @brief 检查会话是否已连接
-     * @return 是否已连接
-     */
-    bool is_connected() const;
-    
-private:
-    /**
-     * @brief 会话处理线程
-     */
-    void process();
-    
-    /**
-     * @brief 处理上传请求
-     * @param buffer 消息缓冲区
-     * @return 是否处理成功
-     */
-    bool handle_upload(const std::vector<uint8_t>& buffer);
-    
-    /**
-     * @brief 处理下载请求
-     * @param buffer 消息缓冲区
-     * @return 是否处理成功
-     */
-    bool handle_download(const std::vector<uint8_t>& buffer);
-    
-    /**
-     * @brief 处理密钥交换请求
-     * @param buffer 消息缓冲区
-     * @return 是否处理成功
-     */
-    bool handle_key_exchange(const std::vector<uint8_t>& buffer);
-    
-    /**
-     * @brief 处理心跳请求并发送响应
-     * @param buffer 消息缓冲区
-     * @return 是否处理成功
-     */
-    bool handle_heartbeat_response(const std::vector<uint8_t>& buffer);
-    
-    /**
-     * @brief 加密数据
-     * @param data 待加密数据
-     * @return 加密后的数据
-     */
-    std::vector<uint8_t> encrypt_data(const std::vector<uint8_t>& data);
-    
-    /**
-     * @brief 解密数据
-     * @param data 待解密数据
-     * @return 解密后的数据
-     */
-    std::vector<uint8_t> decrypt_data(const std::vector<uint8_t>& data);
-    
-private:
-    static std::atomic<size_t> next_session_id_;
-    
-    size_t session_id_;
-    std::unique_ptr<network::TcpSocket> socket_;
-    std::thread thread_;
-    std::atomic<bool> running_;
-    
-    // 加密相关
-    bool encryption_enabled_;
-    std::vector<uint8_t> encryption_key_;
-    std::vector<uint8_t> encryption_iv_;
-    std::vector<uint8_t> dh_private_key_;
-    bool key_exchange_completed_;
 };
 
 /**

@@ -157,7 +157,7 @@ void DownloadMessage::serialize_response() {
 void DownloadMessage::deserialize() {
     const std::vector<uint8_t>& payload = get_payload();
     if (payload.empty()) {
-        LOG_WARNING("DownloadMessage::deserialize: Empty payload");
+        LOG_DEBUG("DownloadMessage::deserialize: Empty payload");
         return;
     }
 
@@ -182,8 +182,7 @@ void DownloadMessage::deserialize() {
         LOG_DEBUG("DownloadMessage::deserialize: Payload preview: %s", data_preview.c_str());
     }
     
-    // 更严格的消息类型识别逻辑
-    // 首先检查LAST_CHUNK标志，如果设置，则肯定是响应消息
+    // 如果设置了LAST_CHUNK标志，则肯定是响应消息
     if (has_last_chunk_flag) {
         // 响应消息格式：|offset(8)|total_size(8)|data(...)|
         if (payload.size() >= sizeof(uint64_t) * 2) {
@@ -213,7 +212,43 @@ void DownloadMessage::deserialize() {
         }
     }
     
-    // 检查请求消息的标记 - 第一个字段应该是一个4字节的文件名长度（uint32_t）
+    // 对于DOWNLOAD类型消息，优先尝试解析为响应消息（大多数情况）
+    // 响应消息格式：|offset(8)|total_size(8)|data(...)|
+    if (payload.size() >= sizeof(uint64_t) * 2) {
+        uint64_t possible_offset, possible_total_size;
+        std::memcpy(&possible_offset, payload.data(), sizeof(uint64_t));
+        std::memcpy(&possible_total_size, payload.data() + sizeof(uint64_t), sizeof(uint64_t));
+        
+        // 转换为主机字节序
+        uint64_t host_offset = net_to_host64(possible_offset);
+        uint64_t host_total_size = net_to_host64(possible_total_size);
+        
+        // 检查是否为合理的响应消息值
+        // 偏移量应该是文件内的合理位置，总大小也应该合理
+        bool looks_like_response = (host_offset < (1ULL << 40)) && 
+                                  (host_total_size < (1ULL << 40)) &&
+                                  (host_offset <= host_total_size || host_total_size == 0);
+        
+        if (looks_like_response) {
+            // 标记为响应消息
+            is_request_ = false;
+            offset_ = host_offset;
+            total_size_ = host_total_size;
+            
+            // 提取响应数据
+            size_t metadata_size = sizeof(uint64_t) * 2;
+            response_data_.clear();
+            if (payload.size() > metadata_size) {
+                response_data_.assign(payload.begin() + metadata_size, payload.end());
+            }
+            
+            LOG_DEBUG("Deserialized download response: offset=%llu, total_size=%llu, data_size=%zu, last_chunk=%d",
+                     offset_, total_size_, response_data_.size(), has_last_chunk_flag ? 1 : 0);
+            return;
+        }
+    }
+    
+    // 如果不像响应消息，尝试解析为请求消息
     // 请求消息格式：|filename_len(4)|filename(...)|offset(8)|length(8)|
     if (payload.size() >= sizeof(uint32_t)) {
         uint32_t filename_len = 0;
@@ -239,8 +274,8 @@ void DownloadMessage::deserialize() {
                 }
                 
                 if (!valid_filename) {
-                    LOG_WARNING("Invalid characters in filename, not treating as request message");
-                    goto try_response; // 尝试作为响应消息解析
+                    LOG_DEBUG("Invalid characters in filename, cannot parse as request message");
+                    goto parse_failed;
                 }
             }
             
@@ -257,56 +292,15 @@ void DownloadMessage::deserialize() {
             offset_ = net_to_host64(offset_);
             length_ = net_to_host64(length_);
             
-            // 额外检查：偏移量和长度应该是合理的值
-            if (offset_ > (1ULL << 40) || length_ > (1ULL << 40)) {
-                LOG_WARNING("Unreasonable offset (%llu) or length (%llu) in request, not treating as request message", offset_, length_);
-                goto try_response; // 尝试作为响应消息解析
-            }
-            
             LOG_DEBUG("Deserialized download request: filename='%s', offset=%llu, length=%llu, encrypted=%d",
                      filename_.c_str(), offset_, length_, has_encrypted_flag ? 1 : 0);
             return;
         }
     }
     
-try_response:
-    // 如果不是请求消息，则尝试解析为响应消息
-    // 响应消息格式：|offset(8)|total_size(8)|data(...)|
-    if (payload.size() >= sizeof(uint64_t) * 2) {
-        uint64_t possible_offset, possible_total_size;
-        std::memcpy(&possible_offset, payload.data(), sizeof(uint64_t));
-        std::memcpy(&possible_total_size, payload.data() + sizeof(uint64_t), sizeof(uint64_t));
-        
-        // 转换为主机字节序
-        uint64_t host_offset = net_to_host64(possible_offset);
-        uint64_t host_total_size = net_to_host64(possible_total_size);
-        
-        // 额外检查：偏移量和总大小应该是合理的值
-        if (host_offset > (1ULL << 40) || host_total_size > (1ULL << 40)) {
-            LOG_WARNING("Unreasonable offset (%llu) or total_size (%llu) in response", host_offset, host_total_size);
-            goto parse_failed; // 解析失败
-        }
-        
-        // 标记为响应消息
-        is_request_ = false;
-        offset_ = host_offset;
-        total_size_ = host_total_size;
-        
-        // 提取响应数据
-        size_t metadata_size = sizeof(uint64_t) * 2;
-        response_data_.clear();
-        if (payload.size() > metadata_size) {
-            response_data_.assign(payload.begin() + metadata_size, payload.end());
-        }
-        
-        LOG_DEBUG("Deserialized download response: offset=%llu, total_size=%llu, data_size=%zu, last_chunk=%d",
-                 offset_, total_size_, response_data_.size(), has_last_chunk_flag ? 1 : 0);
-        return;
-    }
-    
 parse_failed:
     // 如果到这里，说明无法正确解析消息
-    LOG_WARNING("DownloadMessage::deserialize: Failed to parse message, unknown format");
+    LOG_DEBUG("DownloadMessage::deserialize: Failed to parse message, unknown format");
 }
 
 void DownloadMessage::set_encrypted(bool encrypted) {
