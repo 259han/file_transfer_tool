@@ -35,7 +35,7 @@ tmp/
 temp/
 
 # 测试文件和数据
-tests/tmp/
+tests/
 test_file.dat
 *.dat
 test_*.txt
@@ -47,6 +47,7 @@ storage/*
 !storage/.gitkeep
 data/auth/*.json
 data/auth/*.key
+data/
 
 # 操作系统相关
 .DS_Store
@@ -56,5 +57,4 @@ Thumbs.db
 development_guide.md
 read.md
 
-.gitignore
 
