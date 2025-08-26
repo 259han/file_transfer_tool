@@ -6,6 +6,7 @@
 #include <iomanip>
 #include <sstream>
 #include <openssl/sha.h>
+#include <openssl/evp.h>
 #include <openssl/rand.h>
 
 namespace ft {
@@ -198,10 +199,30 @@ std::string UserManager::hash_password(const std::string& password, const std::s
     std::string salted_password = salt + password;
     
     unsigned char hash[SHA256_DIGEST_LENGTH];
-    SHA256_CTX sha256;
-    SHA256_Init(&sha256);
-    SHA256_Update(&sha256, salted_password.c_str(), salted_password.length());
-    SHA256_Final(hash, &sha256);
+    
+    // 使用新的 EVP API 替代废弃的 SHA256 API
+    EVP_MD_CTX* mdctx = EVP_MD_CTX_new();
+    if (!mdctx) {
+        throw std::runtime_error("Failed to create EVP_MD_CTX");
+    }
+    
+    if (EVP_DigestInit_ex(mdctx, EVP_sha256(), nullptr) != 1) {
+        EVP_MD_CTX_free(mdctx);
+        throw std::runtime_error("Failed to initialize SHA256 digest");
+    }
+    
+    if (EVP_DigestUpdate(mdctx, salted_password.c_str(), salted_password.length()) != 1) {
+        EVP_MD_CTX_free(mdctx);
+        throw std::runtime_error("Failed to update SHA256 digest");
+    }
+    
+    unsigned int hash_len = 0;
+    if (EVP_DigestFinal_ex(mdctx, hash, &hash_len) != 1) {
+        EVP_MD_CTX_free(mdctx);
+        throw std::runtime_error("Failed to finalize SHA256 digest");
+    }
+    
+    EVP_MD_CTX_free(mdctx);
     
     std::stringstream ss;
     for (int i = 0; i < SHA256_DIGEST_LENGTH; ++i) {

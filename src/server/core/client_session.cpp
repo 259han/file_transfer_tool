@@ -37,7 +37,7 @@ ClientSession::ClientSession(std::unique_ptr<network::TcpSocket> socket)
         LOG_DEBUG("ClientSession %zu: Created with socket fd=%d, remote=%s:%d", 
                  session_id_,
                  socket_->get_fd(),
-                 socket_->get_remote_address().c_str(),
+                 socket_->get_remote_ip().c_str(),
                  socket_->get_remote_port());
     } else {
         if (!socket_) {
@@ -96,11 +96,10 @@ void ClientSession::stop() {
 }
 
 std::string ClientSession::get_client_address() const {
-    if (!socket_) {
-        return "unknown";
+    if (socket_ && socket_->is_connected()) {
+        return socket_->get_remote_ip() + ":" + std::to_string(socket_->get_remote_port());
     }
-    
-    return socket_->get_remote_address() + ":" + std::to_string(socket_->get_remote_port());
+    return "Disconnected";
 }
 
 size_t ClientSession::get_session_id() const {

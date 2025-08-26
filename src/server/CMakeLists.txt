@@ -1,6 +1,7 @@
 # 添加服务器核心库
 add_library(server_core
     core/server_core.cpp
+    core/server_config.cpp
     core/client_session.cpp
     handlers/file_lock_manager.cpp
     handlers/file_version.cpp

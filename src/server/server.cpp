@@ -33,8 +33,8 @@ void show_help() {
 }
 
 // 解析命令行参数
-ServerConfig parse_args(int argc, char* argv[]) {
-    ServerConfig config;
+void parse_args(int argc, char* argv[]) {
+    ServerConfig& config = ServerConfig::instance();
     
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
@@ -44,32 +44,24 @@ ServerConfig parse_args(int argc, char* argv[]) {
             exit(0);
         } else if (arg == "-p" || arg == "--port") {
             if (i + 1 < argc) {
-                config.port = static_cast<uint16_t>(std::stoi(argv[++i]));
+                config.set_listen_port(static_cast<uint16_t>(std::stoi(argv[++i])));
             }
         } else if (arg == "-d" || arg == "--dir") {
             if (i + 1 < argc) {
-                config.storage_path = argv[++i];
+                config.set_storage_path(argv[++i]);
             }
         } else if (arg == "-c" || arg == "--config") {
             if (i + 1 < argc) {
                 // 加载配置文件
-                utils::ConfigManager::instance().load(argv[++i]);
-                
-                // 从配置文件获取配置
-                config.bind_address = utils::ConfigManager::instance().get_string("bind_address", config.bind_address);
-                config.port = static_cast<uint16_t>(utils::ConfigManager::instance().get_int("port", config.port));
-                config.storage_path = utils::ConfigManager::instance().get_string("storage_path", config.storage_path);
-                config.max_connections = utils::ConfigManager::instance().get_int("max_connections", config.max_connections);
-                config.thread_pool_size = utils::ConfigManager::instance().get_int("thread_pool_size", config.thread_pool_size);
+                config.load_from_file(argv[++i]);
             }
         } else if (arg == "-v" || arg == "--verbose") {
             // 在初始化时会设置详细日志
+            config.set_log_level(0); // debug level
         } else if (arg == "--log-level") {
             // 在初始化时会设置日志级别
         }
     }
-    
-    return config;
 }
 
 int main(int argc, char* argv[]) {
@@ -78,7 +70,8 @@ int main(int argc, char* argv[]) {
     signal(SIGTERM, signal_handler);
     
     // 解析命令行参数
-    ServerConfig config = parse_args(argc, argv);
+    parse_args(argc, argv);
+    ServerConfig& config = ServerConfig::instance();
     
     // 检查日志级别参数
     utils::LogLevel log_level = utils::LogLevel::INFO;
@@ -112,7 +105,7 @@ int main(int argc, char* argv[]) {
         return 1;
     }
     
-    std::cout << "服务器已启动，监听端口: " << config.port << std::endl;
+    std::cout << "服务器已启动，监听端口: " << config.get_listen_port() << std::endl;
     std::cout << "使用 Ctrl+C 停止服务器" << std::endl;
     
     // 等待服务器停止

@@ -1,275 +1,149 @@
 #pragma once
 
 #include <string>
-#include <chrono>
 #include <vector>
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
+#include <chrono>
+#include <memory>
+#include "socket_error.h"
 
 namespace ft {
 namespace network {
 
-/**
- * @brief Socket错误代码
- */
-enum class SocketError {
-    SUCCESS = 0,          // 成功
-    SOCKET_CREATE_FAILED, // 创建socket失败
-    BIND_FAILED,          // 绑定失败
-    LISTEN_FAILED,        // 监听失败
-    CONNECT_FAILED,       // 连接失败
-    ACCEPT_FAILED,        // 接受连接失败
-    SEND_FAILED,          // 发送失败
-    RECV_FAILED,          // 接收失败
-    TIMEOUT,              // 超时
-    CLOSED,               // 连接已关闭
-    INVALID_STATE,        // 无效状态
-    INVALID_ARGUMENT,     // 无效参数
-    UNKNOWN               // 未知错误
-};
-
-/**
- * @brief Socket选项
- */
+// TCP套接字选项
 struct SocketOptions {
-    std::chrono::milliseconds connect_timeout;  // 连接超时时间
-    std::chrono::milliseconds recv_timeout;     // 接收超时时间
-    std::chrono::milliseconds send_timeout;     // 发送超时时间
-    bool keep_alive;                            // 是否启用TCP保活
-    int keep_idle;                              // 保活空闲时间(秒)
-    int keep_interval;                          // 保活探测间隔(秒)
-    int keep_count;                             // 保活探测次数
-    int recv_buffer_size;                       // 接收缓冲区大小
-    int send_buffer_size;                       // 发送缓冲区大小
-    bool reuse_address;                         // 是否复用地址
-    bool reuse_port;                            // 是否复用端口
-    bool non_blocking;                          // 是否使用非阻塞模式
+    // 连接超时
+    std::chrono::milliseconds connect_timeout;
     
-    SocketOptions()
-        : connect_timeout(std::chrono::seconds(10)),
-          recv_timeout(std::chrono::seconds(30)),
-          send_timeout(std::chrono::seconds(30)),
-          keep_alive(true),
-          keep_idle(60),            // 60秒后开始探测
-          keep_interval(5),         // 每5秒探测一次
-          keep_count(3),            // 探测3次无响应则认为连接断开
-          recv_buffer_size(256 * 1024),  // 256KB
-          send_buffer_size(256 * 1024),  // 256KB
-          reuse_address(true),
-          reuse_port(false),
-          non_blocking(false) {
-    }
+    // 接收超时
+    std::chrono::milliseconds recv_timeout;
+    
+    // 发送超时
+    std::chrono::milliseconds send_timeout;
+    
+    // 保活选项
+    bool keep_alive;
+    int keep_idle;      // 空闲时间（秒）
+    int keep_interval;  // 探测间隔（秒）
+    int keep_count;     // 探测次数
+    
+    // 缓冲区大小
+    int recv_buffer_size;
+    int send_buffer_size;
+    
+    // 地址和端口重用
+    bool reuse_address;
+    bool reuse_port;
+    
+    // 非阻塞模式
+    bool non_blocking;
+    
+    // 构造函数设置默认值
+    SocketOptions();
 };
 
-/**
- * @brief TCP Socket类
- */
+// TCP套接字类
 class TcpSocket {
 public:
-    /**
-     * @brief 构造函数
-     * @param options Socket选项
-     */
+    // 构造函数
     explicit TcpSocket(const SocketOptions& options = SocketOptions());
     
-    /**
-     * @brief 从已有的套接字创建TcpSocket
-     * @param sockfd 套接字描述符
-     * @param options Socket选项
-     */
-    TcpSocket(int sockfd, const SocketOptions& options = SocketOptions());
-    
-    /**
-     * @brief 复制构造函数 - 仅对已连接的socket进行拷贝
-     * @param other 要复制的TcpSocket对象
-     */
-    TcpSocket(const TcpSocket& other);
-    
-    /**
-     * @brief 赋值运算符 - 实现深拷贝
-     * @param other 要赋值的TcpSocket对象
-     * @return TcpSocket引用
-     */
-    TcpSocket& operator=(const TcpSocket& other);
-    
-    /**
-     * @brief 移动构造函数
-     * @param other 要移动的TcpSocket对象
-     */
-    TcpSocket(TcpSocket&& other) noexcept;
-    
-    /**
-     * @brief 移动赋值运算符
-     * @param other 要移动赋值的TcpSocket对象
-     * @return TcpSocket引用
-     */
-    TcpSocket& operator=(TcpSocket&& other) noexcept;
-    
-    /**
-     * @brief 析构函数
-     */
+    // 析构函数
     ~TcpSocket();
     
-    /**
-     * @brief 绑定地址和端口
-     * @param host 主机地址
-     * @param port 端口
-     * @return 错误代码
-     */
-    SocketError bind(const std::string& host, uint16_t port);
+    // 禁用拷贝构造和赋值
+    TcpSocket(const TcpSocket&) = delete;
+    TcpSocket& operator=(const TcpSocket&) = delete;
     
-    /**
-     * @brief 开始监听
-     * @param backlog 等待队列大小
-     * @return 错误代码
-     */
-    SocketError listen(int backlog = 5);
+    // 移动构造和赋值
+    TcpSocket(TcpSocket&& other) noexcept;
+    TcpSocket& operator=(TcpSocket&& other) noexcept;
     
-    /**
-     * @brief 接受连接
-     * @param client_socket 接受的客户端socket
-     * @return 错误代码
-     */
-    SocketError accept(TcpSocket& client_socket);
-    
-    /**
-     * @brief 连接到服务器
-     * @param host 服务器地址
-     * @param port 服务器端口
-     * @return 错误代码
-     */
+    // 连接到服务器
     SocketError connect(const std::string& host, uint16_t port);
     
-    /**
-     * @brief 发送数据
-     * @param data 数据指针
-     * @param len 数据长度
-     * @param sent_len 发送的字节数
-     * @return 错误代码
-     */
-    SocketError send(const void* data, size_t len, size_t& sent_len);
+    // 绑定到本地地址
+    SocketError bind(const std::string& ip, uint16_t port);
     
-    /**
-     * @brief 接收数据
-     * @param buffer 缓冲区指针
-     * @param len 缓冲区大小
-     * @param received_len 接收的字节数
-     * @return 错误代码
-     */
-    SocketError recv(void* buffer, size_t len, size_t& received_len);
+    // 开始监听
+    SocketError listen(int backlog = 128);
     
-    /**
-     * @brief 发送所有数据
-     * @param data 数据指针
-     * @param len 数据长度
-     * @return 错误代码
-     */
-    SocketError send_all(const void* data, size_t len);
+    // 接受连接
+    std::unique_ptr<TcpSocket> accept();
     
-    /**
-     * @brief 接收指定大小的数据
-     * @param buffer 缓冲区指针
-     * @param len 需要接收的字节数
-     * @return 错误代码
-     */
-    SocketError recv_all(void* buffer, size_t len);
-    
-    /**
-     * @brief 关闭套接字
-     */
+    // 关闭连接
     void close();
     
-    /**
-     * @brief 获取套接字描述符
-     * @return 套接字描述符
-     */
-    int get_fd() const;
+    // 发送数据（确保全部发送）
+    SocketError send_all(const void* data, size_t len);
     
-    /**
-     * @brief 获取本地地址
-     * @return 本地地址
-     */
-    std::string get_local_address() const;
+    // 接收数据（确保全部接收）
+    SocketError recv_all(void* buffer, size_t len);
     
-    /**
-     * @brief 获取本地端口
-     * @return 本地端口
-     */
-    uint16_t get_local_port() const;
+    // 发送单个数据包
+    SocketError send(const void* data, size_t len, size_t& sent);
     
-    /**
-     * @brief 获取远程地址
-     * @return 远程地址
-     */
-    std::string get_remote_address() const;
+    // 接收单个数据包
+    SocketError recv(void* buffer, size_t len, size_t& received);
     
-    /**
-     * @brief 获取远程端口
-     * @return 远程端口
-     */
-    uint16_t get_remote_port() const;
+    // 设置接收超时
+    void set_recv_timeout(std::chrono::milliseconds timeout);
     
-    /**
-     * @brief 是否已连接
-     * @return 是否已连接
-     */
+    // 零拷贝发送文件（Linux sendfile系统调用）
+    SocketError sendfile_zero_copy(int file_fd, off_t offset, size_t count, size_t& sent);
+    
+    // 零拷贝发送内存映射文件
+    SocketError send_mmap_zero_copy(void* mmap_addr, size_t len);
+    
+    // 设置非阻塞模式
+    bool set_non_blocking(bool non_blocking);
+    
+    // 获取本地地址信息
+    std::string get_local_ip() const { return local_ip_; }
+    uint16_t get_local_port() const { return local_port_; }
+    
+    // 获取远程地址信息
+    std::string get_remote_ip() const { return remote_ip_; }
+    uint16_t get_remote_port() const { return remote_port_; }
+    
+    // 获取最后一个错误
+    SocketError get_last_error() const { return last_error_; }
+    
+    // 检查是否已连接
     bool is_connected() const;
     
-    /**
-     * @brief 设置非阻塞模式
-     * @param non_blocking 是否非阻塞
-     */
-    void set_non_blocking(bool non_blocking);
+    // 获取底层文件描述符
+    int get_fd() const { return sockfd_; }
     
-    /**
-     * @brief 设置接收超时
-     * @param timeout 超时时间
-     */
-    void set_recv_timeout(const std::chrono::milliseconds& timeout);
-    
-    /**
-     * @brief 设置发送超时
-     * @param timeout 超时时间
-     */
-    void set_send_timeout(const std::chrono::milliseconds& timeout);
-    
-    /**
-     * @brief 获取最后一次操作的错误代码
-     * @return 错误代码
-     */
-    SocketError get_last_error() const;
-    
-private:
-    /**
-     * @brief 应用socket选项
-     */
+    // 应用套接字选项
     void apply_socket_options();
     
-    /**
-     * @brief 获取socket地址信息
-     * @param addr 地址结构体
-     * @param ip 输出IP地址
-     * @param port 输出端口
-     */
-    static void get_socket_address(const struct sockaddr_in& addr, std::string& ip, uint16_t& port);
-    
-    /**
-     * @brief 内部检查连接状态，非const方法，可以更新connected_状态
-     * @return 是否已连接
-     */
-    bool check_connection_state_();
-    
 private:
+    // 更新本地地址信息
+    void update_local_address();
+    
+    // 更新远程地址信息
+    void update_remote_address();
+    
+    // 底层文件描述符
     int sockfd_;
+    
+    // 套接字选项
     SocketOptions options_;
+    
+    // 连接状态
     bool connected_;
+    
+    // 本地地址信息
     std::string local_ip_;
     uint16_t local_port_;
+    
+    // 远程地址信息
     std::string remote_ip_;
     uint16_t remote_port_;
+    
+    // 最后一个错误
     SocketError last_error_;
 };
 
 } // namespace network
-} // namespace ft 
+} // namespace ft

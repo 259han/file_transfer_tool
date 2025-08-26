@@ -155,6 +155,9 @@ private:
     std::vector<std::function<void(LogLevel, const std::string&)>> listeners_;
 };
 
+// 日志级别宏，用于运行时检查
+#define LOG_LEVEL ft::utils::Logger::instance().get_level()
+
 // 日志宏定义，方便使用
 #define LOG_DEBUG(format, ...) ft::utils::Logger::instance().log(ft::utils::LogLevel::DEBUG, __FILE__, __LINE__, __FUNCTION__, format, ##__VA_ARGS__)
 #define LOG_INFO(format, ...) ft::utils::Logger::instance().log(ft::utils::LogLevel::INFO, __FILE__, __LINE__, __FUNCTION__, format, ##__VA_ARGS__)

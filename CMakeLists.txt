@@ -15,6 +15,9 @@ set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
 # 添加测试选项
 option(BUILD_TESTS "Build test programs" ON)
 
+# 添加异步服务器选项
+option(BUILD_ASYNC_SERVER "Build async server version" ON)
+
 # 查找外部依赖
 find_package(OpenSSL REQUIRED)
 if(NOT OpenSSL_FOUND)
@@ -54,4 +57,57 @@ add_subdirectory(src)
 if(BUILD_TESTS)
     message(STATUS "Building tests")
     add_subdirectory(tests)
+endif()
+
+# 如果构建异步服务器，添加异步相关目标
+if(BUILD_ASYNC_SERVER)
+    message(STATUS "Building async server")
+    
+    # 异步网络库
+    add_library(async_network
+        src/common/network/async/event_loop.cpp
+        src/common/utils/threading/thread_pool.cpp
+    )
+    
+    # 异步服务器核心库
+    add_library(async_server_core
+        src/server/core/async_server_core.cpp
+    )
+    
+    # 异步服务器链接依赖
+    target_link_libraries(async_server_core
+        PRIVATE
+            async_network
+            server_core
+            common_protocol
+            common_network
+            common_utils
+            Threads::Threads
+    )
+    
+    # 异步服务器可执行文件
+    add_executable(async_server_main
+        src/server/async_server_main.cpp
+    )
+    
+    target_link_libraries(async_server_main
+        PRIVATE
+            async_server_core
+    )
+    
+    # 性能测试工具
+    add_executable(performance_test
+        tools/performance_test.cpp
+    )
+    
+    target_link_libraries(performance_test
+        PRIVATE
+            Threads::Threads
+    )
+    
+    # 设置平台特定选项
+    if(WIN32)
+        target_link_libraries(performance_test PRIVATE ws2_32)
+    endif()
+    
 endif() 

@@ -151,9 +151,9 @@ void test_network() {
     // 测试绑定功能（不实际监听）
     SocketError err = server_socket.bind("127.0.0.1", 0); // 使用系统分配的端口
     if (err == SocketError::SUCCESS) {
-        LOG_INFO("绑定成功: %s:%d", server_socket.get_local_address().c_str(), server_socket.get_local_port());
+        LOG_INFO("绑定成功: %s:%d", server_socket.get_local_ip().c_str(), server_socket.get_local_port());
         std::cout << "Bind successful on: " 
-                  << server_socket.get_local_address() << ":" 
+                  << server_socket.get_local_ip() << ":" 
                   << server_socket.get_local_port() << std::endl;
     } else {
         LOG_ERROR("绑定失败: %d", static_cast<int>(err));

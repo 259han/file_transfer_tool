@@ -4,6 +4,7 @@ add_library(common_utils
     config/config_manager.cpp
     crypto/encryption.cpp
     auth/user_manager.cpp
+    threading/thread_pool.cpp
 )
 
 # 设置包含目录
@@ -18,4 +19,5 @@ target_include_directories(common_utils
 target_link_libraries(common_utils
     PRIVATE
         OpenSSL::Crypto
+        Threads::Threads
 ) 

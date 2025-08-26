@@ -10,29 +10,15 @@
 #include <unordered_map>
 #include "../../common/network/socket/tcp_socket.h"
 #include "../../common/utils/logging/logger.h"
+#include "../../common/utils/threading/thread_pool.h"
+#include "../../common/utils/auth/user_manager.h"
+#include "server_config.h"
 #include "client_session.h"
 
 namespace ft {
 namespace server {
 
-/**
- * @brief 服务器配置结构体
- */
-struct ServerConfig {
-    std::string bind_address;       // 监听地址
-    uint16_t port;                  // 监听端口
-    std::string storage_path;       // 存储路径
-    size_t max_connections;         // 最大连接数
-    size_t thread_pool_size;        // 线程池大小
-    
-    ServerConfig()
-        : bind_address("0.0.0.0"),
-          port(12345),
-          storage_path("./storage"),
-          max_connections(100),
-          thread_pool_size(4) {
-    }
-};
+// ServerConfig 类已在 server_config.h 中定义
 
 /**
  * @brief 服务器核心类
@@ -69,6 +55,18 @@ public:
     void stop();
     
     /**
+     * @brief 初始化服务器（兼容性方法）
+     * @param config_file 配置文件路径
+     * @return 是否初始化成功
+     */
+    bool init(const std::string& config_file);
+    
+    /**
+     * @brief 运行服务器
+     */
+    void run();
+    
+    /**
      * @brief 是否正在运行
      * @return 是否正在运行
      */
@@ -84,7 +82,7 @@ public:
      * @return 服务器配置
      */
     const ServerConfig& get_config() const {
-        return config_;
+        return ServerConfig::instance();
     }
     
     /**
@@ -101,6 +99,12 @@ public:
         return storage_path_;
     }
     
+    /**
+     * @brief 获取用户管理器
+     * @return 用户管理器指针
+     */
+    utils::UserManager* get_user_manager();
+    
 private:
     /**
      * @brief 接受连接线程
@@ -112,15 +116,29 @@ private:
      */
     void session_manager_thread();
     
+    /**
+     * @brief 处理客户端会话
+     * @param session_id 会话ID
+     */
+    void handle_client_session(size_t session_id);
+    
 private:
-    ServerConfig config_;
     std::unique_ptr<network::TcpSocket> listen_socket_;
+    std::unique_ptr<network::TcpSocket> listener_;  // 兼容性成员
     std::thread accept_thread_;
     std::thread session_manager_thread_;
     std::atomic<bool> running_;
     
     std::condition_variable stop_cv_;
     std::mutex stop_mutex_;
+    
+    // 会话管理
+    std::unordered_map<size_t, std::shared_ptr<ClientSession>> sessions_;
+    mutable std::mutex sessions_mutex_;  // mutable 以支持 const 成员函数中的加锁
+    std::atomic<size_t> next_session_id_{1};
+    
+    // 线程池
+    std::unique_ptr<utils::ThreadPool> thread_pool_;
     
     // 静态存储路径
     static std::string storage_path_;

@@ -77,6 +77,7 @@ bool remove_user(const std::vector<std::string>& args) {
  * @brief 列出所有用户
  */
 bool list_users(const std::vector<std::string>& args) {
+    (void)args;  // 消除未使用参数警告
     UserManager& manager = UserManager::instance();
     auto users = manager.get_user_list();
     

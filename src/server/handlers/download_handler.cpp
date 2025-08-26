@@ -444,5 +444,21 @@ bool DownloadHandler::send_data_chunk(const std::vector<uint8_t>& data, uint64_t
     return true;
 }
 
+bool DownloadHandler::send_error_response(const std::string& error_msg) {
+    protocol::Message error_response(protocol::OperationType::ERROR);
+    error_response.set_payload(error_msg.data(), error_msg.size());
+    
+    std::vector<uint8_t> response_buffer;
+    error_response.encode(response_buffer);
+    
+    try {
+        get_socket().send_all(response_buffer.data(), response_buffer.size());
+        return false; // 返回false表示处理失败
+    } catch (const std::exception& e) {
+        LOG_ERROR("Session %zu: Exception while sending error response: %s", get_session_id(), e.what());
+        return false;
+    }
+}
+
 } // namespace server
 } // namespace ft 

@@ -1,77 +1,115 @@
 #include "server_core.h"
-#include "client_session.h"
-#include "../session/session_manager.h"
+#include "server_config.h"
 #include "../../common/utils/logging/logger.h"
-#include "../../common/utils/auth/user_manager.h"
 #include <filesystem>
-#include <iostream>
-#include <thread>
-#include <chrono>
 
 namespace fs = std::filesystem;
 
 namespace ft {
 namespace server {
 
-ServerCore::ServerCore() 
-    : config_(),
-      listen_socket_(nullptr),
-      accept_thread_(),
-      session_manager_thread_(),
-      running_(false) {
+// 静态成员初始化  
+std::string ServerCore::storage_path_ = "./storage";
+
+ServerCore::ServerCore() : running_(false) {
 }
 
 ServerCore::~ServerCore() {
     stop();
 }
 
-bool ServerCore::initialize(const ServerConfig& config, utils::LogLevel log_level) {
-    // 初始化日志系统
-    if (!utils::Logger::instance().init(log_level)) {
-        std::cerr << "Failed to initialize logger" << std::endl;
-        return false;
-    }
+bool ServerCore::initialize(const ServerConfig& user_config, utils::LogLevel log_level) {
+    // 注意：这里接受的config参数主要用于外部传入配置
+    // 但我们使用单例的ServerConfig来存储配置
+    ServerConfig& config = ServerConfig::instance();
     
-    config_ = config;
-    storage_path_ = config.storage_path;
+    // 如果传入了配置，则更新单例配置
+    config.set_listen_address(user_config.get_listen_address());
+    config.set_listen_port(user_config.get_listen_port());
+    config.set_storage_path(user_config.get_storage_path());
+    config.set_log_level(user_config.get_log_level());
+    config.set_log_file(user_config.get_log_file());
+    config.set_max_connections(user_config.get_max_connections());
+    config.set_thread_pool_size(user_config.get_thread_pool_size());
+    config.set_encryption_enabled(user_config.is_encryption_enabled());
+    config.set_users_file(user_config.get_users_file());
+    config.set_tcp_optimization_enabled(user_config.is_tcp_optimization_enabled());
+    config.set_tcp_send_buffer_size(user_config.get_tcp_send_buffer_size());
+    config.set_tcp_recv_buffer_size(user_config.get_tcp_recv_buffer_size());
+    config.set_zero_copy_enabled(user_config.is_zero_copy_enabled());
+    
+    // 初始化日志系统
+    ft::utils::Logger::instance().init(
+        log_level, 
+        true, 
+        config.get_log_file()
+    );
+    
+    LOG_INFO("Initializing server core...");
     
     // 创建存储目录
-    try {
-        if (!fs::exists(storage_path_)) {
-            if (!fs::create_directories(storage_path_)) {
-                LOG_ERROR("Failed to create storage directory: %s", storage_path_.c_str());
+    storage_path_ = config.get_storage_path();
+    if (!fs::exists(storage_path_)) {
+        LOG_INFO("Creating storage directory: %s", storage_path_.c_str());
+        try {
+            fs::create_directories(storage_path_);
+        } catch (const std::exception& e) {
+            LOG_ERROR("Failed to create storage directory: %s", e.what());
                 return false;
             }
         }
-    } catch (const std::exception& e) {
-        LOG_ERROR("Exception while creating storage directory: %s", e.what());
-        return false;
-    }
     
     // 初始化用户管理器
-    std::string users_file = "data/auth/users.json";
-    std::string api_keys_file = "data/auth/api_keys.json";
-    
-    // 确保认证数据目录存在
-    try {
-        if (!fs::exists("data/auth")) {
-            if (!fs::create_directories("data/auth")) {
-                LOG_ERROR("Failed to create auth data directory: data/auth");
-                return false;
-            }
-        }
-    } catch (const std::exception& e) {
-        LOG_ERROR("Exception while creating auth data directory: %s", e.what());
+    if (!utils::UserManager::instance().initialize(config.get_users_file())) {
+        LOG_ERROR("Failed to initialize user manager with file: %s", config.get_users_file().c_str());
         return false;
     }
     
-    if (!utils::UserManager::instance().initialize(users_file, api_keys_file)) {
-        LOG_ERROR("Failed to initialize UserManager");
+    // 创建线程池
+    size_t thread_count = config.get_thread_pool_size();
+    if (thread_count == 0) {
+        thread_count = std::thread::hardware_concurrency();
+    }
+    thread_pool_ = std::make_unique<utils::ThreadPool>(thread_count);
+    LOG_INFO("Thread pool initialized with %zu threads", thread_count);
+    
+    // 创建TCP监听器
+    network::SocketOptions socket_options;
+    
+    // 应用TCP优化配置
+    if (config.is_tcp_optimization_enabled()) {
+        LOG_INFO("Applying TCP optimizations");
+        socket_options.recv_buffer_size = config.get_tcp_recv_buffer_size();
+        socket_options.send_buffer_size = config.get_tcp_send_buffer_size();
+        socket_options.non_blocking = true;
+        socket_options.reuse_address = true;
+        socket_options.reuse_port = true;
+        
+        LOG_INFO("TCP buffer sizes: send=%d, recv=%d", 
+                 socket_options.send_buffer_size, socket_options.recv_buffer_size);
+    }
+    
+    listener_ = std::make_unique<network::TcpSocket>(socket_options);
+    
+    // 绑定监听地址和端口
+    network::SocketError err = listener_->bind(config.get_listen_address(), config.get_listen_port());
+    if (err != network::SocketError::SUCCESS) {
+        LOG_ERROR("Failed to bind to %s:%d", 
+                 config.get_listen_address().c_str(), config.get_listen_port());
         return false;
     }
     
-    // 初始化会话管理器
-    SessionManager::instance().set_max_sessions(config.max_connections);
+    // 开始监听
+    err = listener_->listen();
+    if (err != network::SocketError::SUCCESS) {
+        LOG_ERROR("Failed to listen on %s:%d", 
+                 config.get_listen_address().c_str(), config.get_listen_port());
+        return false;
+    }
+    
+    LOG_INFO("Server listening on %s:%d", 
+             config.get_listen_address().c_str(), config.get_listen_port());
+    LOG_INFO("Zero-copy transfer: %s", config.is_zero_copy_enabled() ? "enabled" : "disabled");
     
     return true;
 }
@@ -79,77 +117,22 @@ bool ServerCore::initialize(const ServerConfig& config, utils::LogLevel log_leve
 bool ServerCore::start() {
     if (running_) {
         LOG_WARNING("Server is already running");
-        return false;
+        return true;
     }
     
-    // 创建监听socket
-    listen_socket_ = std::make_unique<network::TcpSocket>();
-    
-    // 绑定地址
-    network::SocketError err = listen_socket_->bind(config_.bind_address, config_.port);
-    if (err != network::SocketError::SUCCESS) {
-        LOG_ERROR("Failed to bind to %s:%d, error: %d", 
-                 config_.bind_address.c_str(), config_.port, static_cast<int>(err));
-        return false;
-    }
-    
-    // 开始监听
-    err = listen_socket_->listen(config_.max_connections);
-    if (err != network::SocketError::SUCCESS) {
-        LOG_ERROR("Failed to listen on %s:%d, error: %d", 
-                 config_.bind_address.c_str(), config_.port, static_cast<int>(err));
-        return false;
-    }
-    
-    LOG_INFO("Server started on %s:%d", config_.bind_address.c_str(), config_.port);
-    
-    // 标记为运行状态
+    LOG_INFO("Starting server...");
     running_ = true;
     
     // 启动接受连接线程
-    accept_thread_ = std::thread(&ServerCore::accept_thread, this);
+    accept_thread_ = std::thread(&ServerCore::run, this);
     
-    // 启动会话管理线程
-    session_manager_thread_ = std::thread(&ServerCore::session_manager_thread, this);
-    
+    LOG_INFO("Server started successfully");
     return true;
 }
 
-void ServerCore::stop() {
-    if (!running_) {
-        return;
-    }
-    
-    LOG_INFO("Stopping server...");
-    
-    // 标记停止状态
-    running_ = false;
-    
-    // 关闭监听socket以中断accept
-    if (listen_socket_) {
-        listen_socket_->close();
-        listen_socket_.reset();
-    }
-    
-    // 等待接受连接线程结束
+void ServerCore::wait() {
     if (accept_thread_.joinable()) {
         accept_thread_.join();
-    }
-    
-    // 等待会话管理线程结束
-    if (session_manager_thread_.joinable()) {
-        session_manager_thread_.join();
-    }
-    
-    // 关闭所有会话
-    SessionManager::instance().close_all_sessions();
-    
-    LOG_INFO("Server stopped");
-    
-    // 通知等待的线程
-    {
-        std::lock_guard<std::mutex> lock(stop_mutex_);
-        stop_cv_.notify_all();
     }
 }
 
@@ -157,87 +140,210 @@ bool ServerCore::is_running() const {
     return running_;
 }
 
-void ServerCore::wait() {
-    std::unique_lock<std::mutex> lock(stop_mutex_);
-    stop_cv_.wait(lock, [this] { return !running_; });
-}
-
 size_t ServerCore::get_session_count() const {
-    return SessionManager::instance().get_session_count();
+    std::lock_guard<std::mutex> lock(sessions_mutex_);
+    return sessions_.size();
 }
 
-void ServerCore::accept_thread() {
-    LOG_INFO("Accept thread started");
+bool ServerCore::init(const std::string& config_file) {
+    // 加载配置
+    ServerConfig& config = ServerConfig::instance();
+    if (!config_file.empty()) {
+        if (!config.load_from_file(config_file)) {
+            LOG_ERROR("Failed to load configuration from file: %s", config_file.c_str());
+            return false;
+        }
+    }
+    
+    // 初始化日志系统
+    ft::utils::Logger::instance().init(
+        static_cast<ft::utils::LogLevel>(config.get_log_level()), 
+        true, 
+        config.get_log_file()
+    );
+    
+    LOG_INFO("Initializing server core...");
+    
+    // 创建存储目录
+    storage_path_ = config.get_storage_path();
+    if (!fs::exists(storage_path_)) {
+        LOG_INFO("Creating storage directory: %s", storage_path_.c_str());
+        try {
+            fs::create_directories(storage_path_);
+        } catch (const std::exception& e) {
+            LOG_ERROR("Failed to create storage directory: %s", e.what());
+            return false;
+        }
+    }
+    
+    // 初始化用户管理器
+    if (!utils::UserManager::instance().initialize(config.get_users_file())) {
+        LOG_ERROR("Failed to initialize user manager with file: %s", config.get_users_file().c_str());
+        return false;
+    }
+    
+    // 创建线程池
+    size_t thread_count = config.get_thread_pool_size();
+    if (thread_count == 0) {
+        thread_count = std::thread::hardware_concurrency();
+    }
+    thread_pool_ = std::make_unique<utils::ThreadPool>(thread_count);
+    LOG_INFO("Thread pool initialized with %zu threads", thread_count);
+    
+    // 创建TCP监听器
+    network::SocketOptions socket_options;
+    
+    // 应用TCP优化配置
+    if (config.is_tcp_optimization_enabled()) {
+        LOG_INFO("Applying TCP optimizations");
+        socket_options.recv_buffer_size = config.get_tcp_recv_buffer_size();
+        socket_options.send_buffer_size = config.get_tcp_send_buffer_size();
+        socket_options.non_blocking = true;
+        socket_options.reuse_address = true;
+        socket_options.reuse_port = true;
+        
+        LOG_INFO("TCP buffer sizes: send=%d, recv=%d", 
+                 socket_options.send_buffer_size, socket_options.recv_buffer_size);
+    }
+    
+    listener_ = std::make_unique<network::TcpSocket>(socket_options);
+    
+    // 绑定监听地址和端口
+    network::SocketError err = listener_->bind(config.get_listen_address(), config.get_listen_port());
+    if (err != network::SocketError::SUCCESS) {
+        LOG_ERROR("Failed to bind to %s:%d", 
+                 config.get_listen_address().c_str(), config.get_listen_port());
+        return false;
+    }
+    
+    // 开始监听
+    err = listener_->listen();
+    if (err != network::SocketError::SUCCESS) {
+        LOG_ERROR("Failed to listen on %s:%d", 
+                 config.get_listen_address().c_str(), config.get_listen_port());
+        return false;
+    }
+    
+    LOG_INFO("Server listening on %s:%d", 
+             config.get_listen_address().c_str(), config.get_listen_port());
+    LOG_INFO("Zero-copy transfer: %s", config.is_zero_copy_enabled() ? "enabled" : "disabled");
+    
+    running_ = true;
+    return true;
+}
+
+void ServerCore::run() {
+    LOG_INFO("Server core running...");
     
     while (running_) {
-        // 创建临时socket接收新连接
-        network::TcpSocket client_socket;
-        
-        // 接受新的连接
-        network::SocketError err = listen_socket_->accept(client_socket);
-        if (err != network::SocketError::SUCCESS) {
-            if (running_) {
-                LOG_ERROR("Failed to accept connection, error: %d", static_cast<int>(err));
-                std::this_thread::sleep_for(std::chrono::seconds(1));
+        // 接受新连接
+        auto client_socket = listener_->accept();
+        if (!client_socket) {
+            if (!running_) {
+                break;  // 服务器已停止
             }
+            
+            LOG_ERROR("Failed to accept client connection: %d", 
+                     static_cast<int>(listener_->get_last_error()));
             continue;
         }
         
-        // 设置socket选项
-        client_socket.set_recv_timeout(std::chrono::seconds(3));
-        client_socket.set_send_timeout(std::chrono::seconds(3));
-        
-        // 记录连接信息
-        LOG_INFO("New connection from %s:%d", 
-                 client_socket.get_remote_address().c_str(), 
-                 client_socket.get_remote_port());
-        
-        int socket_fd = client_socket.get_fd();
-        if (socket_fd < 0) {
-            LOG_ERROR("Invalid socket file descriptor: %d", socket_fd);
-            continue;
+        // 创建新会话
+        size_t session_id;
+        {
+            std::lock_guard<std::mutex> lock(sessions_mutex_);
+            session_id = next_session_id_++;
+            
+            // 检查是否超过最大连接数
+            if (sessions_.size() >= ServerConfig::instance().get_max_connections()) {
+                LOG_WARNING("Maximum connections reached (%zu), rejecting new connection", 
+                           ServerConfig::instance().get_max_connections());
+                continue;
+            }
+            
+            // 创建新的客户端会话
+            auto session = std::make_shared<ClientSession>(std::move(client_socket));
+            
+            // 零拷贝配置在会话内部处理
+            
+            // 添加到会话列表
+            sessions_[session_id] = session;
         }
         
-        // 创建客户端会话
-        LOG_DEBUG("Creating ClientSession with socket fd=%d", socket_fd);
-        std::shared_ptr<ClientSession> session = std::make_shared<ClientSession>(
-            std::make_unique<network::TcpSocket>(std::move(client_socket)));
+        LOG_INFO("New client connected: session_id=%zu", session_id);
         
-        // 检查session的socket是否有效
-        LOG_DEBUG("Created ClientSession - id=%zu, client=%s", 
-                 session->get_session_id(), 
-                 session->get_client_address().c_str());
-        
-        // 使用会话管理器添加会话
-        if (SessionManager::instance().add_session(session) == 0) {
-            LOG_WARNING("Failed to add session to SessionManager, max sessions may be reached");
-            continue;
+        // 在线程池中处理会话
+        thread_pool_->enqueue([this, session_id]() {
+            handle_client_session(session_id);
+        });
+    }
+    
+    LOG_INFO("Server core stopped");
+}
+
+void ServerCore::stop() {
+    LOG_INFO("Stopping server core...");
+    
+    running_ = false;
+    
+    // 关闭监听器
+    if (listener_) {
+        listener_->close();
+    }
+    
+    // 关闭所有会话
+    {
+        std::lock_guard<std::mutex> lock(sessions_mutex_);
+        for (auto& pair : sessions_) {
+            pair.second->stop();
         }
-        
-        // 启动会话线程
-        LOG_DEBUG("Starting session %zu", session->get_session_id());
+        sessions_.clear();
+    }
+    
+    // 停止线程池
+    if (thread_pool_) {
+        thread_pool_->stop();
+    }
+    
+    LOG_INFO("Server core cleanup completed");
+}
+
+void ServerCore::handle_client_session(size_t session_id) {
+    std::shared_ptr<ClientSession> session;
+    
+    // 获取会话
+    {
+        std::lock_guard<std::mutex> lock(sessions_mutex_);
+        auto it = sessions_.find(session_id);
+        if (it == sessions_.end()) {
+            LOG_ERROR("Session %zu not found", session_id);
+            return;
+        }
+        session = it->second;
+    }
+    
+    try {
+        // 处理会话
         session->start();
+    } catch (const std::exception& e) {
+        LOG_ERROR("Exception in session %zu: %s", session_id, e.what());
     }
     
-    LOG_INFO("Accept thread exiting");
-}
-
-void ServerCore::session_manager_thread() {
-    LOG_INFO("Session manager thread started");
-    
-    while (running_) {
-        // 定时清理过期会话
-        std::this_thread::sleep_for(std::chrono::seconds(5));
-        SessionManager::instance().clean_expired_sessions();
-        
-        LOG_DEBUG("Current active sessions: %zu", SessionManager::instance().get_session_count());
+    // 会话结束，移除
+    {
+        std::lock_guard<std::mutex> lock(sessions_mutex_);
+        auto it = sessions_.find(session_id);
+        if (it != sessions_.end()) {
+            LOG_INFO("Session %zu closed", session_id);
+            sessions_.erase(it);
+            
+        }
     }
-    
-    LOG_INFO("Session manager thread exiting");
 }
 
-// 静态成员初始化
-std::string ServerCore::storage_path_;
+utils::UserManager* ServerCore::get_user_manager() {
+    return &utils::UserManager::instance();
+}
 
 } // namespace server
 } // namespace ft 

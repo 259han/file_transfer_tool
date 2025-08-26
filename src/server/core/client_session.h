@@ -152,12 +152,13 @@ public:
      * @return 是否有权限
      */
     bool has_permission(uint8_t permission) const;
-
-private:
+    
     /**
-     * @brief 会话处理线程
+     * @brief 会话处理线程（供异步服务器调用）
      */
     void process();
+
+private:
     
     /**
      * @brief 处理心跳请求并发送响应
